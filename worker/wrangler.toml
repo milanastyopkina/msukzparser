@@ -1,0 +1,11 @@
+name = "msu-schedule-bot"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+[triggers]
+crons = ["* * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "msu-schedule"
+database_id = "PUT_YOUR_D1_ID_HERE"   # выдаст `wrangler d1 create msu-schedule`
