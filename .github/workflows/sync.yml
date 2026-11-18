@@ -22,8 +22,10 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
         working-directory: worker
         run: |
+          sed -i "s/PUT_YOUR_D1_ID_HERE/$D1_DATABASE_ID/" wrangler.toml
           npm ci --no-audit --no-fund
           NEW=$(cat ../out/load.sha256); OLD=$(cat ../data/load.sha256 2>/dev/null || true)
           if [ "$NEW" != "$OLD" ]; then
