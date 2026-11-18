@@ -28,9 +28,20 @@ jobs:
           sed -i "s/PUT_YOUR_D1_ID_HERE/$D1_DATABASE_ID/" wrangler.toml
           npm ci --no-audit --no-fund
           NEW=$(cat ../out/load.sha256); OLD=$(cat ../data/load.sha256 2>/dev/null || true)
+          CHANGED=0
           if [ "$NEW" != "$OLD" ]; then
             npx wrangler d1 execute msu-schedule --remote --file ../out/load.sql
             cp ../out/load.sha256 ../data/load.sha256
-            cd .. && git config user.name "schedule-bot" && git config user.email "bot@users.noreply.github.com" && git add data/load.sha256 && git commit -m "d1: loaded" && git push; cd worker
+            CHANGED=1
           fi
           npx wrangler d1 execute msu-schedule --remote --file ../out/checked.sql
+          if [ "$CHANGED" = "1" ]; then
+            cd ..
+            git checkout -- worker/wrangler.toml
+            git config user.name "schedule-bot"
+            git config user.email "bot@users.noreply.github.com"
+            git add data/load.sha256
+            git commit -m "d1: loaded"
+            git pull --rebase
+            git push
+          fi
