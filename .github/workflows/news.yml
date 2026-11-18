@@ -23,7 +23,9 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
         run: |
+          sed -i "s/PUT_YOUR_D1_ID_HERE/$D1_DATABASE_ID/" worker/wrangler.toml
           cd worker && npm ci --no-audit --no-fund
           npx wrangler d1 execute msu-schedule --remote --file ../out/news.sql
           cd .. && git config user.name "schedule-bot" && git config user.email "bot@users.noreply.github.com"
