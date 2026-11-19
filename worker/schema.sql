@@ -14,3 +14,4 @@ CREATE TABLE IF NOT EXISTS users (chat_id INTEGER PRIMARY KEY, group_code TEXT, 
 CREATE TABLE IF NOT EXISTS sent (chat_id INTEGER, k TEXT, PRIMARY KEY(chat_id, k));
 CREATE TABLE IF NOT EXISTS news (id INTEGER PRIMARY KEY, feed TEXT, feeds TEXT, title TEXT, url TEXT, seen INTEGER);
 CREATE TABLE IF NOT EXISTS subs (chat_id INTEGER, feed TEXT, since INTEGER, PRIMARY KEY(chat_id, feed));
+CREATE INDEX IF NOT EXISTS ix_users_group ON users(group_code);
