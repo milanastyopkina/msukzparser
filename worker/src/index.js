@@ -196,8 +196,23 @@ const INFO_TEXT = `<b>Что умеет Мудлик</b>
 Бот работает только в личных сообщениях.`;
 
 // Разовая рассылка всем пользователям (по одному разу на id). Чтобы разослать новое — поменяйте id и текст.
-// Идёт только днём (8:00–22:00) и только на остаток лимита, поэтому не мешает напоминаниям.
-const BROADCAST = { id: "info1", text: INFO_TEXT };
+// Идёт на остаток лимита (ночью — без звука), поэтому не мешает напоминаниям.
+const UPDATE_TEXT = `🆕 <b>Первое обновление Мудлика</b>
+Всем большое спасибо, что пользуетесь ботом и помогаете сделать его лучше! В этом обновлении добавлено:
+
+🗺 <b>Карты кабинетов</b>
+Команда /room 507 (или любой другой кабинет 5–7 этажа) присылает карту этажа с отмеченным кабинетом. Карты есть для блока B, 5–7 этажи.
+
+🔔 <b>Карта перед парой</b>
+В /notify можно включить «Карта кабинета за 20 минут до пары»: бот пришлёт фото с пометкой, где будет пара, и сразу время, кабинет и преподавателя. По умолчанию выключено.
+
+🕗 <b>Расписание теперь обновляется раз в день, вечером в 20:00</b>
+В конце каждого ответа указана дата последнего обновления и следующего. Новости с сайта проверяются в 8:00 и 20:00, расписание на следующую неделю приходит в воскресенье в 20:30.
+
+⚠️ Если расписание в боте не совпадает с настоящим, напишите @aitufmstaff и пришлите фото или файл актуального расписания. Обновим вручную.
+
+Все команды и их краткое описание: /info`;
+const BROADCAST = { id: "upd1", text: UPDATE_TEXT };
 
 async function handleMessage(env, msg) {
   const chat = msg.chat.id;
@@ -387,11 +402,11 @@ async function tick(env) {
     for (const u of us) { jobs.push({ chat_id: u.chat_id, key: "mon:" + today, text }); budget--; }
   }
   // 5) разовая рассылка (ниже по приоритету, чем всё остальное)
-  if (budget > 0 && BROADCAST && m >= 8 * 60 && m < 22 * 60) {
+  if (budget > 0 && BROADCAST) {   // ночью (22:00–08:00) уходит без звука
     const { results: us } = await env.DB.prepare(
       `SELECT u.chat_id FROM users u WHERE u.notify=1
          AND NOT EXISTS (SELECT 1 FROM sent s WHERE s.chat_id=u.chat_id AND s.k=?1) LIMIT ?2`).bind("bc:" + BROADCAST.id, Math.min(budget, 20)).all();
-    for (const u of us) { jobs.push({ chat_id: u.chat_id, key: "bc:" + BROADCAST.id, text: BROADCAST.text }); budget--; }
+    for (const u of us) { jobs.push({ chat_id: u.chat_id, key: "bc:" + BROADCAST.id, text: BROADCAST.text, extra: (m < 8 * 60 || m >= 22 * 60) ? { disable_notification: true } : {} }); budget--; }
   }
   if (!jobs.length) return;
   // длинные сообщения (неделя) уходят несколькими частями: не выходим за лимит подзапросов
@@ -408,7 +423,7 @@ async function tick(env) {
       if (j.photo) {
         r = await sendPhoto(env, j.chat_id, j.photo, j.text);
         if (!r?.ok && r?.error_code === 400) r = await send(env, j.chat_id, j.text);   // картинка недоступна — шлём обычный текст
-      } else r = await send(env, j.chat_id, j.text);
+      } else r = await send(env, j.chat_id, j.text, j.extra || {});
       const c = r?.error_code ?? 0;
       if (r?.ok) return;
       if (c === 403) undo.push(env.DB.prepare("UPDATE users SET notify=0 WHERE chat_id=?1").bind(j.chat_id)); // бот заблокирован
