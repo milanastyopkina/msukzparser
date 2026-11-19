@@ -1,4 +1,5 @@
 // Telegram-бот расписания КФ МГУ: webhook + cron (раз в минуту). Cloudflare Workers + D1.
+import ROOMS from "./rooms.json";
 const TZ = 5 * 3600 * 1000; // Казахстан, UTC+5 без перехода на летнее время
 const SUPPORT_URL = "https://t.me/aitufmstaff";
 const supportKb = { inline_keyboard: [[{ text: "✉️ Написать в поддержку", url: SUPPORT_URL }]] };
@@ -7,6 +8,11 @@ const GREETINGS = [
   "С понедельником! ☀️ Желаю продуктивной недели, вовремя найденных кабинетов и хороших оценок. Удачи!",
   "Новая неделя — новые возможности! 🚀 Удачной учёбы, бодрого настроения и поменьше дедлайнов.",
 ];
+// Карты кабинетов: PNG лежат в репозитории (maps/png), Telegram сам скачивает их по ссылке
+const MAP_BASE = "https://raw.githubusercontent.com/milanastyopkina/msukzparser/main/maps/";
+const MAP_LEAD = 20;                                            // за сколько минут до пары присылать карту
+const roomNo = (l) => (!l.zid && l.mode !== "ДО" && /^(\d{3})(?!\d)/.exec(l.room || "")?.[1]) || null;
+const mapUrl = (no) => (ROOMS[no] ? MAP_BASE + ROOMS[no].img.split("/").map(encodeURIComponent).join("/") : null);
 const FEEDS = {
   ann: "📢 Объявления", news: "📰 Новости", conf: "🎓 Конференции и семинары",
   lect: "🎤 Гостевые лекции", olymp: "🏆 Олимпиады", school: "🏫 Школы юных МГУ",
@@ -49,6 +55,9 @@ async function send(env, chat_id, text, extra = {}) {
     r = await tg(env, "sendMessage", { chat_id, text: ps[i], parse_mode: "HTML", disable_web_page_preview: true,
       ...(i === ps.length - 1 ? extra : {}) });
   return r;
+}
+async function sendPhoto(env, chat_id, photo, caption, extra = {}) {
+  return tg(env, "sendPhoto", { chat_id, photo, caption, parse_mode: "HTML", ...extra });
 }
 // постоянное сравнение строк (секреты не угадываются по времени ответа)
 function safeEq(a, b) {
@@ -101,18 +110,19 @@ async function rangeText(env, group, from, days, title) {
   return rangeFromRows(group, results, title);
 }
 
-// Парсер работает по расписанию Actions (06:07 … 23:07 по Астане); ночью не обновляем
-const SLOTS = [6, 9, 12, 15, 18, 21, 23];
+// Парсер Moodle запускается один раз в день вечером (см. sync.yml, ~19:50–20:00 по Астане): по просьбе техотдела вуза
+const UPDATE_HOUR = 20;
+const MON_GEN = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"];
+const dayMonth = (s) => `${+s.slice(8)} ${MON_GEN[+s.slice(5, 7) - 1]}`;
 async function freshness(env) {
   const r = await env.DB.prepare("SELECT v FROM meta WHERE k='checked'").first();
   if (!r?.v) return "";
   const c = new Date(Date.parse(r.v) + TZ), n = nowLocal(env);
-  const t = `${hhmm(c.getUTCHours() * 60 + c.getUTCMinutes())}`;
-  const when = iso(c) === iso(n) ? t : `${fmtDate(iso(c))} ${t}`;
   const nm = n.getUTCHours() * 60 + n.getUTCMinutes();
-  const next = SLOTS.find((h) => h * 60 + 7 > nm);
-  const nxt = next !== undefined ? `сегодня ≈ ${next}:00` : "завтра ≈ 6:00";
-  return `\n\n🕒 <i>Расписание актуально на ${when}. Следующее обновление: ${nxt}.</i>`;
+  // сегодняшнее обновление ещё впереди (или как раз идёт) -> «сегодня», иначе -> завтра
+  const todayAhead = nm < UPDATE_HOUR * 60 || (iso(c) < iso(n) && nm < (UPDATE_HOUR + 1) * 60);
+  const nextDay = todayAhead ? iso(n) : iso(addDays(n, 1));
+  return `\n\n🕒 <i>Расписание актуально на ${UPDATE_HOUR}:00, ${dayMonth(iso(c))}. Следующее обновление: ${dayMonth(nextDay)} в ${UPDATE_HOUR}:00.</i>`;
 }
 async function reply(env, chat, text) { return send(env, chat, text + (await freshness(env))); }
 
@@ -135,6 +145,14 @@ async function subsKeyboard(env, chat) {
 }
 const SUBS_TEXT = "Выберите, о чём присылать короткие уведомления (заголовок + ссылка на сайт msu.kz). Нажатие включает/выключает раздел:";
 
+const NOTIFY_TEXT = "Настройки уведомлений. Нажатие включает или выключает пункт:";
+async function notifyKeyboard(env, chat) {
+  const u = await env.DB.prepare("SELECT notify, map_pre FROM users WHERE chat_id=?1").bind(chat).first();
+  return { inline_keyboard: [
+    [{ text: (u?.notify ? "🔔 Уведомления: вкл" : "🔕 Уведомления: выкл"), callback_data: "n:t" }],
+    [{ text: (u?.map_pre ? "✅ " : "⬜ ") + `Карта кабинета за ${MAP_LEAD} мин до пары`, callback_data: "n:m" }] ] };
+}
+
 async function userGroup(env, chat) {
   const u = await env.DB.prepare("SELECT group_code, notify FROM users WHERE chat_id=?1").bind(chat).first();
   return u;
@@ -146,6 +164,41 @@ async function chooseGroup(env, chat) {
   return send(env, chat, "Выберите свою группу:", { reply_markup: kb });
 }
 
+const INFO_TEXT = `<b>Что умеет Мудлик</b>
+
+Выберите группу через /start — и бот будет показывать расписание и напоминать о парах.
+
+<b>Расписание</b>
+/today — на сегодня
+/tomorrow — на завтра
+/week — на текущую неделю
+/nextweek — на следующую неделю (доступно, как только оно появится на сайте)
+/next — ближайшая пара
+/group — сменить группу
+/room 507 — карта кабинета (5–7 этажи)
+
+<b>Уведомления</b> (включены по умолчанию)
+• в воскресенье в 20:30 — расписание на всю следующую неделю с кабинетами
+• за час до первой пары — расписание на день
+• за 15 минут до каждой пары — какая пара и в каком кабинете
+Настройки: /notify. Там же можно включить карту кабинета: за 20 минут до пары бот пришлёт карту этажа с отмеченным кабинетом.
+Выключить и включить все уведомления: /notify off и /notify on
+
+<b>Новости и объявления</b>
+/news — выберите, какие разделы сайта msu.kz вам интересны: объявления, новости, конференции и семинары, гостевые лекции, олимпиады, школы юных МГУ. По умолчанию включены только «Объявления». Приходит короткий заголовок и ссылка на сайт.
+
+<b>Актуальность</b>
+Расписание обновляется раз в день, вечером в 20:00. Внизу каждого ответа указана дата последнего обновления и следующего. Если расписание изменилось в течение дня, напишите нам через /support, мы обновим вручную.
+
+<b>Поддержка</b>
+/support — написать нам, если нашли ошибку. Приложите фото или файл настоящего расписания, мы обновим его вручную.
+
+Бот работает только в личных сообщениях.`;
+
+// Разовая рассылка всем пользователям (по одному разу на id). Чтобы разослать новое — поменяйте id и текст.
+// Идёт только днём (8:00–22:00) и только на остаток лимита, поэтому не мешает напоминаниям.
+const BROADCAST = { id: "info1", text: INFO_TEXT };
+
 async function handleMessage(env, msg) {
   const chat = msg.chat.id;
   const fl = flood(chat);
@@ -153,12 +206,17 @@ async function handleMessage(env, msg) {
   if (fl === "warn") return send(env, chat, "Слишком много запросов. Подождите минуту.");
   const text = (msg.text || "").trim();
   const cmd = text.split(/[\s@]/)[0].toLowerCase();
+  if (cmd === "/info" || cmd === "/help") return send(env, chat, INFO_TEXT, { reply_markup: supportKb });
   if (cmd === "/support") return send(env, chat, "Возник вопрос или нашли ошибку в расписании? Напишите нам:", { reply_markup: supportKb });
   if (cmd === "/start" || cmd === "/group") return chooseGroup(env, chat);
   const u = await userGroup(env, chat);
   if (!u?.group_code) return chooseGroup(env, chat);
   const today = iso(nowLocal(env));
   const g = u.group_code;
+  if (["/today", "/tomorrow", "/week", "/nextweek", "/next"].includes(cmd)) {
+    const has = await env.DB.prepare("SELECT 1 FROM cur_lessons WHERE group_code=?1 LIMIT 1").bind(g).first();
+    if (!has) return reply(env, chat, `Для группы <b>${esc(g)}</b> расписание пока не опубликовано на Moodle. Как только оно появится, оно будет здесь автоматически.`);
+  }
   if (cmd === "/news") return send(env, chat, SUBS_TEXT, { reply_markup: await subsKeyboard(env, chat) });
   if (cmd === "/today") return reply(env, chat, await dayText(env, g, today, "📅 Сегодня"));
   if (cmd === "/tomorrow") return reply(env, chat, await dayText(env, g, iso(addDays(nowLocal(env), 1)), "📅 Завтра"));
@@ -177,13 +235,25 @@ async function handleMessage(env, msg) {
       .bind(g, today, m).first();
     return reply(env, chat, l ? `⏭ Ближайшая пара — <b>${fmtDate(l.date)}</b>\n\n${lessonLine(l)}` : "Ближайших занятий в расписании нет.");
   }
+  if (cmd === "/room") {
+    const no = (text.split(/\s+/)[1] || "").replace(/\D/g, "");
+    if (!no) return send(env, chat, "Напишите номер кабинета, например: /room 507");
+    const r = ROOMS[no];
+    if (!r) return send(env, chat, `Карты для кабинета ${esc(no)} пока нет. Карты есть для кабинетов 5–7 этажей.`);
+    const cap = r.hl ? `🗺 Кабинет <b>${no}</b> · ${r.floor} этаж` : `🗺 Кабинет <b>${no}</b> · ${r.floor} этаж (общая схема этажа)`;
+    const ph = await sendPhoto(env, chat, mapUrl(no), cap);
+    return ph?.ok ? ph : send(env, chat, `Кабинет <b>${no}</b> — ${r.floor} этаж.`);
+  }
   if (cmd === "/notify") {
-    const on = /off|выкл|0/i.test(text) ? 0 : 1;
-    await env.DB.prepare("UPDATE users SET notify=?2 WHERE chat_id=?1").bind(chat, on).run();
-    return send(env, chat, on ? "🔔 Уведомления включены." : "🔕 Уведомления выключены. Вернуть: /notify on");
+    if (/\b(off|on)\b|выкл|вкл/i.test(text.slice(8))) {
+      const on = /off|выкл|0/i.test(text.slice(8)) ? 0 : 1;
+      await env.DB.prepare("UPDATE users SET notify=?2 WHERE chat_id=?1").bind(chat, on).run();
+      return send(env, chat, on ? "🔔 Уведомления включены." : "🔕 Уведомления выключены. Вернуть: /notify on");
+    }
+    return send(env, chat, NOTIFY_TEXT, { reply_markup: await notifyKeyboard(env, chat) });
   }
   return send(env, chat,
-    `Ваша группа: <b>${esc(g)}</b>\n\n/today — сегодня\n/tomorrow — завтра\n/week — неделя\n/nextweek — следующая неделя\n/next — ближайшая пара\n/group — сменить группу\n/news — подписка на новости и объявления\n/notify on|off — уведомления\n/support — написать в поддержку`, { reply_markup: supportKb });
+    `Ваша группа: <b>${esc(g)}</b>\n\n/today — сегодня\n/tomorrow — завтра\n/week — неделя\n/nextweek — следующая неделя\n/next — ближайшая пара\n/group — сменить группу\n/news — подписка на новости и объявления\n/notify — настройки уведомлений\n/room 507 — карта кабинета\n/support — написать в поддержку`, { reply_markup: supportKb });
 }
 
 async function handleCallback(env, cb) {
@@ -199,6 +269,12 @@ async function handleCallback(env, cb) {
     if (had) await env.DB.prepare("DELETE FROM subs WHERE chat_id=?1 AND feed=?2").bind(chat, feed).run();
     else await env.DB.prepare("INSERT INTO subs(chat_id,feed,since) VALUES(?1,?2,?3)").bind(chat, feed, nowSec(env)).run();
     return tg(env, "editMessageReplyMarkup", { chat_id: chat, message_id: cb.message.message_id, reply_markup: await subsKeyboard(env, chat) });
+  }
+  if (cb.data === "n:t" || cb.data === "n:m") {
+    await tg(env, "answerCallbackQuery", { callback_query_id: cb.id });
+    const col = cb.data === "n:t" ? "notify" : "map_pre";
+    await env.DB.prepare(`UPDATE users SET ${col} = 1 - COALESCE(${col},0) WHERE chat_id=?1`).bind(chat).run();
+    return tg(env, "editMessageReplyMarkup", { chat_id: chat, message_id: cb.message.message_id, reply_markup: await notifyKeyboard(env, chat) });
   }
   if (cb.data?.startsWith("g:")) {
     const code = cb.data.slice(2);
@@ -219,9 +295,10 @@ async function handleCallback(env, cb) {
 // разбирают очередь партиями; когда народу мало — ждём точного времени.
 const MAX_SENDS = 38;
 const pick = (cands, T, budget) => {
-  const due = cands.filter((c) => c.lead <= T).sort((a, b) => a.lead - b.lead);
+  const tt = (c) => c.T ?? T;
+  const due = cands.filter((c) => c.lead <= tt(c)).sort((a, b) => a.lead - b.lead);
   let out = due.slice(0, budget);
-  if (cands.length > budget) out = out.concat(cands.filter((c) => c.lead > T).sort((a, b) => a.lead - b.lead).slice(0, budget - out.length));
+  if (cands.length > budget) out = out.concat(cands.filter((c) => c.lead > tt(c)).sort((a, b) => a.lead - b.lead).slice(0, budget - out.length));
   return out;
 };
 const groupBy = (rows, f) => { const m = new Map(); for (const r of rows) { const k = f(r); (m.get(k) || m.set(k, []).get(k)).push(r); } return m; };
@@ -234,14 +311,20 @@ async function tick(env) {
   // 1) за 15 минут до пары (рассылка допускается с 22-й минуты, если очередь большая)
   {
     const { results } = await env.DB.prepare(
-      `SELECT u.chat_id, l.* FROM users u JOIN cur_lessons l ON l.group_code=u.group_code
-       WHERE u.notify=1 AND l.date=?1 AND l.start_min-?2 BETWEEN 5 AND 22
+      `SELECT u.chat_id, u.map_pre, l.* FROM users u JOIN cur_lessons l ON l.group_code=u.group_code
+       WHERE u.notify=1 AND l.date=?1 AND l.start_min-?2 BETWEEN 5 AND CASE WHEN u.map_pre=1 THEN 27 ELSE 22 END
          AND NOT EXISTS (SELECT 1 FROM sent s WHERE s.chat_id=u.chat_id AND s.k='pre:'||l.date||':'||l.start_min)
        ORDER BY l.start_min, u.chat_id, l.sub`).bind(today, m).all();
-    const cands = [...groupBy(results, (r) => r.chat_id + "|" + r.start_min).values()].map((rows) => ({
-      chat_id: rows[0].chat_id, key: `pre:${today}:${rows[0].start_min}`, lead: rows[0].start_min - m,
-      text: `⏰ Через ${rows[0].start_min - m} мин:\n\n` + rows.map((l) => lessonLine(l)).join("\n\n") }));
-    for (const c of pick(cands, 15, budget)) { jobs.push(c); budget--; }
+    const cands = [...groupBy(results, (r) => r.chat_id + "|" + r.start_min).values()].map((rows) => {
+      const withMap = rows[0].map_pre === 1;
+      const nos = [...new Set(rows.map(roomNo).filter(Boolean))];
+      const photo = withMap && nos.length === 1 && rows.every((r) => roomNo(r) === nos[0]) ? mapUrl(nos[0]) : null;
+      const target = withMap ? MAP_LEAD : 15;
+      const text = `⏰ Через ${rows[0].start_min - m} мин:\n\n` + rows.map((l) => lessonLine(l)).join("\n\n");
+      return { chat_id: rows[0].chat_id, key: `pre:${today}:${rows[0].start_min}`, lead: rows[0].start_min - m - target,
+        T: 0, text, photo: photo && text.length <= 1000 ? photo : null };
+    });
+    for (const c of pick(cands, 0, budget)) { jobs.push(c); budget--; }
   }
 
   // 2) за час до первой пары — расписание на сегодня
@@ -280,8 +363,8 @@ async function tick(env) {
     }
   }
 
-  // 3) воскресенье 18:00–18:30 — расписание следующей недели
-  if (budget > 0 && d.getUTCDay() === 0 && m >= 18 * 60 && m < 18 * 60 + 30) {
+  // 3) воскресенье 20:30–21:30 — расписание следующей недели (после вечернего обновления в 20:00)
+  if (budget > 0 && d.getUTCDay() === 0 && m >= 20 * 60 + 30 && m < 21 * 60 + 30) {
     const { results: us } = await env.DB.prepare(
       `SELECT u.chat_id, u.group_code FROM users u WHERE u.notify=1 AND u.group_code IS NOT NULL
          AND NOT EXISTS (SELECT 1 FROM sent s WHERE s.chat_id=u.chat_id AND s.k='sun:'||?1) LIMIT ?2`).bind(today, budget).all();
@@ -303,10 +386,17 @@ async function tick(env) {
     const text = GREETINGS[Math.floor(Date.parse(today) / 604800000) % GREETINGS.length];
     for (const u of us) { jobs.push({ chat_id: u.chat_id, key: "mon:" + today, text }); budget--; }
   }
+  // 5) разовая рассылка (ниже по приоритету, чем всё остальное)
+  if (budget > 0 && BROADCAST && m >= 8 * 60 && m < 22 * 60) {
+    const { results: us } = await env.DB.prepare(
+      `SELECT u.chat_id FROM users u WHERE u.notify=1
+         AND NOT EXISTS (SELECT 1 FROM sent s WHERE s.chat_id=u.chat_id AND s.k=?1) LIMIT ?2`).bind("bc:" + BROADCAST.id, Math.min(budget, 20)).all();
+    for (const u of us) { jobs.push({ chat_id: u.chat_id, key: "bc:" + BROADCAST.id, text: BROADCAST.text }); budget--; }
+  }
   if (!jobs.length) return;
   // длинные сообщения (неделя) уходят несколькими частями: не выходим за лимит подзапросов
   let used = 0; const fit = [];
-  for (const j of jobs) { const n = parts(j.text).length; if (used + n > MAX_SENDS) break; used += n; fit.push(j); }
+  for (const j of jobs) { const n = j.photo ? 2 : parts(j.text).length; if (used + n > MAX_SENDS) break; used += n; fit.push(j); }
   jobs.length = 0; jobs.push(...fit);
 
   // сначала отметка (один пакетный запрос), потом отправка: при сбое лучше пропуск, чем дубль
@@ -314,7 +404,11 @@ async function tick(env) {
   const undo = [];
   for (let i = 0; i < jobs.length; i += 10) {           // по 10 параллельно, Telegram терпит ~30 сообщений/сек
     await Promise.all(jobs.slice(i, i + 10).map(async (j) => {
-      const r = await send(env, j.chat_id, j.text);
+      let r;
+      if (j.photo) {
+        r = await sendPhoto(env, j.chat_id, j.photo, j.text);
+        if (!r?.ok && r?.error_code === 400) r = await send(env, j.chat_id, j.text);   // картинка недоступна — шлём обычный текст
+      } else r = await send(env, j.chat_id, j.text);
       const c = r?.error_code ?? 0;
       if (r?.ok) return;
       if (c === 403) undo.push(env.DB.prepare("UPDATE users SET notify=0 WHERE chat_id=?1").bind(j.chat_id)); // бот заблокирован
@@ -325,7 +419,7 @@ async function tick(env) {
   }
   if (undo.length) await env.DB.batch(undo);
   if (m === 4 * 60) {
-    await env.DB.prepare("DELETE FROM sent WHERE k NOT LIKE 'n:%' AND k NOT LIKE '%'||?1||'%'").bind(today).run();
+    await env.DB.prepare("DELETE FROM sent WHERE k NOT LIKE 'n:%' AND k NOT LIKE 'bc:%' AND k NOT LIKE '%'||?1||'%'").bind(today).run();
     await env.DB.prepare("DELETE FROM sent WHERE k LIKE 'n:%' AND CAST(substr(k,3) AS INTEGER) IN (SELECT id FROM news WHERE seen < ?1)").bind(nowSec(env) - 7 * 86400).run();
   }
 }
@@ -343,7 +437,7 @@ export default {
         { command: "today", description: "Расписание на сегодня" }, { command: "tomorrow", description: "На завтра" },
         { command: "week", description: "На неделю" }, { command: "nextweek", description: "Следующая неделя" },
         { command: "next", description: "Ближайшая пара" }, { command: "group", description: "Сменить группу" },
-        { command: "news", description: "Подписка на новости и объявления" }, { command: "notify", description: "Уведомления on/off" }, { command: "support", description: "Написать в поддержку" }] });
+        { command: "news", description: "Подписка на новости и объявления" }, { command: "notify", description: "Настройки уведомлений" }, { command: "room", description: "Карта кабинета: /room 507" }, { command: "info", description: "Что умеет бот" }, { command: "support", description: "Написать в поддержку" }] });
       return Response.json({ setWebhook: a, setMyCommands: b });
     }
     if (req.method === "POST" && url.pathname === "/webhook") {
