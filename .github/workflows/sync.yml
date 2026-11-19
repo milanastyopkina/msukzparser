@@ -13,7 +13,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12", cache: pip, cache-dependency-path: parser/requirements.txt }
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq libreoffice-writer
+      - name: Установить LibreOffice (с повтором при зависании зеркала)
+        timeout-minutes: 10
+        run: |
+          for i in 1 2 3; do
+            timeout 240 bash -c 'sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends libreoffice-writer' && break
+            echo "попытка $i не удалась, повтор"; sleep 5
+          done
+          which soffice libreoffice || { echo "LibreOffice не установлен"; exit 1; }
       - run: pip install -r parser/requirements.txt
       - id: sync
         run: python parser/sync.py
