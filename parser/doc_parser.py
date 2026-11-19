@@ -22,6 +22,7 @@ MONTHS = {
     "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
     "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
 }
+START_TO_PAIR = {"09:00": 1, "10:40": 2, "12:30": 3, "14:10": 4, "15:50": 5, "17:30": 6, "19:10": 7, "20:50": 8}
 ROMAN = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6, "VII": 7, "VIII": 8}
 
 TIME_RE = re.compile(r"(\d{1,2})[.:](\d{2})\s*[-–—]\s*(\d{1,2})[.:](\d{2})")
@@ -290,7 +291,7 @@ def parse_docx(path: str, fallback_codes: list[str] | None = None) -> ParsedDoc:
     headers: list[dict] = []        # [{c0, c1, codes, program}]
     day: int | None = None
     named_days = False
-    prev_pair = 0
+    prev_start = ""
 
     for table in doc.tables:
         own_headers: list[dict] = []
@@ -326,6 +327,8 @@ def parse_docx(path: str, fallback_codes: list[str] | None = None) -> ParsedDoc:
             tm = TIME_RE.fullmatch(squash(cells[time_i][0]))
             pair = _pair_number(cells[pair_i][0])
             start, end = hm(tm.group(1), tm.group(2)), hm(tm.group(3), tm.group(4))
+            # номер пары по времени надёжнее, чем римская цифра (в файлах бывают опечатки вроде «IV» вместо «VI»)
+            pair = START_TO_PAIR.get(start, pair)
 
             # день недели
             found = None
@@ -337,8 +340,8 @@ def parse_docx(path: str, fallback_codes: list[str] | None = None) -> ParsedDoc:
             if found is not None:
                 day, named_days = found, True
             elif not named_days:
-                day = 0 if day is None else (day + 1 if pair < prev_pair else day)
-            prev_pair = pair
+                day = 0 if day is None else (day + 1 if start < prev_start else day)
+            prev_start = start
             if day is None or day > 5:
                 res.warnings.append(f"день недели вышел за пределы Пн–Сб (пара {pair})")
                 continue
