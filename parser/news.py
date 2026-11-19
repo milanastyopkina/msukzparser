@@ -56,6 +56,8 @@ def build_sql(items: dict[int, dict], new_ids: set[int], baseline: bool) -> str:
         lines.append(
             f"INSERT INTO news (id, feed, feeds, title, url, seen) VALUES ({i}, {q(it['feeds'][0])}, {q(',' + ','.join(it['feeds']) + ',')}, "
             f"{q(it['title'])}, {q(it['url'])}, {seen}) ON CONFLICT(id) DO UPDATE SET feeds=excluded.feeds;")
+    if new_ids and not baseline:
+        lines.append("INSERT OR REPLACE INTO meta (k, v) VALUES ('news_ver', CAST(strftime('%s','now') AS TEXT));")   # сигнал боту: есть что рассылать
     return "\n".join(lines) + "\n"
 
 
