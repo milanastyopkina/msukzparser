@@ -1,8 +1,8 @@
 name: sync-news
 on:
-  schedule: [{ cron: "*/20 1-18 * * *" }]   # каждые ~20 минут с 06:00 до 23:40 по Астане
+  schedule: [{ cron: "5 3,15 * * *" }]   # два раза в сутки: 08:05 и 20:05 по Астане (UTC+5), по просьбе техотдела вуза
   workflow_dispatch: {}
-permissions: { contents: write }
+permissions: { contents: write }   # только запись коммитов в этот репозиторий
 concurrency: news
 jobs:
   news:
