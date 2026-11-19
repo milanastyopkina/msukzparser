@@ -1,8 +1,9 @@
 name: sync-schedule
 on:
-  schedule: [{ cron: "7 1,4,7,10,13,16,18 * * *" }]   # 06:07 … 23:07 по Астане (UTC+5)
+  schedule: [{ cron: "7 1,4,7,10,13,16,18 * * *" }]   # 06:07 … 23:07 по Астане (UTC+5); с 23:07 до 06:07 не запускаем
   workflow_dispatch: {}
-permissions: { contents: write }
+  push: { paths: ["manual/*.json", "manual/*.doc", "manual/*.docx"] }    # положили файл в manual/ — сразу пересчитать
+permissions: { contents: write }   # только запись коммитов в этот репозиторий
 concurrency: sync
 jobs:
   sync:
