@@ -144,13 +144,39 @@ def title_codes(title: str) -> list[str]:
     return parse_codes(title)
 
 
-def reconcile(code: str, wanted: list[str]) -> str:
-    """В шапке файла «ВМК-11», а в названии на Moodle «ВМ-11» — берём вариант из названия."""
-    if code in wanted:
-        return code
-    num = code.split("-")[-1]
-    same = [w for w in wanted if w.split("-")[-1] == num]
-    return same[0] if len(same) == 1 else code
+def related(a: str, b: str) -> bool:
+    """ВМ-11 и ВМК-11 — одна группа под разными названиями (одна буквенная часть начинается с другой)."""
+    (pa, na), (pb, nb) = a.rsplit("-", 1), b.rsplit("-", 1)
+    return na == nb and (pa.startswith(pb) or pb.startswith(pa))
+
+
+CODE_OK = re.compile(r"[А-ЯЁ]{1,5}-\d{2}")
+
+
+PAIR_TIMES = {1: ("09:00", "10:30"), 2: ("10:40", "12:10"), 3: ("12:30", "14:00"),
+              4: ("14:10", "15:40"), 5: ("15:50", "17:20"), 6: ("17:30", "19:00")}
+
+
+def parse_manual_json(data: dict) -> ParsedDoc:
+    """Ручной файл manual/*.json — для случаев, когда расписания в виде документа нет (например, только фото на стенде)."""
+    pd = ParsedDoc()
+    mon = dt.date.fromisoformat(data["week_start"])
+    if mon.weekday() != 0:
+        raise ValueError("week_start должен быть понедельником")
+    pd.week_start, pd.week_end = mon, mon + dt.timedelta(days=5)
+    pd.academic_year = mon.year if mon.month >= 8 else mon.year - 1
+    zoom = data.get("zoom") or {}
+    for it in data["lessons"]:
+        a, b = PAIR_TIMES[int(it["pair"])]
+        z = "zoom" in str(it.get("room", "")).lower()
+        for code in it["groups"]:
+            g = pd.groups.setdefault(code, {"program": data.get("program", ""), "lessons": []})
+            g["lessons"].append({
+                "dow": int(it["day"]), "pair": int(it["pair"]), "start": it.get("start", a), "end": it.get("end", b),
+                "subject": it["subject"], "kind": it.get("kind", ""), "room": it.get("room", ""),
+                "teacher": it.get("teacher", ""), "sub": it.get("sub", ""), "mode": it.get("mode", ""),
+                "zid": zoom.get("id", "") if z else "", "zcode": zoom.get("code", "") if z else ""})
+    return pd
 
 
 def build(resources: list[dict], paths: dict[int, Path], errors: dict[int, str],
@@ -162,43 +188,59 @@ def build(resources: list[dict], paths: dict[int, Path], errors: dict[int, str],
         rid = res["id"]
         rep = {"id": rid, "title": res["title"], "groups": [], "lessons": 0, "note": ""}
         report.append(rep)
-        if rid in errors:
+        if rid in errors and res.get("json") is None:
             rep["note"] = errors[rid]
             continue
         try:
-            pd: ParsedDoc = parse_docx(str(paths[rid]), fallback_codes=title_codes(res["title"]))
+            pd: ParsedDoc = (parse_manual_json(res["json"]) if res.get("json") is not None
+                             else parse_docx(str(paths[rid]), fallback_codes=title_codes(res["title"])))
         except Exception as e:  # noqa: BLE001 — один плохой файл не должен ронять всё
             rep["note"] = f"ошибка разбора: {type(e).__name__}: {e}"
             continue
         if pd.warnings:
             rep["note"] = "; ".join(pd.warnings)
-        if not pd.week_start or not pd.groups:
+        if not pd.groups:
             continue
         if pd.academic_year and pd.academic_year < ay_now:
             rep["note"] = "прошлый учебный год"
             continue
-        if pd.week_end < today - dt.timedelta(days=KEEP_DAYS_JSON):
-            rep["note"] = "неделя уже прошла"
-            continue
-        wanted = title_codes(res["title"])
         degree = "master" if "магистр" in res["section"].lower() else "bachelor"
-        for code0, g in pd.groups.items():
-            code = reconcile(code0, wanted)
-            if not re.fullmatch(r"[А-ЯЁ]{1,5}-\d{2}", code):   # кнопки бота и callback_data — только нормальные коды
+        fresh = bool(pd.week_start) and pd.week_end >= today - dt.timedelta(days=KEEP_DAYS_JSON)
+        if not fresh:
+            rep["note"] = (rep["note"] + "; " if rep["note"] else "") + "неделя уже прошла"
+        for code, g in pd.groups.items():
+            # ВАЖНО: код группы берём только из самого файла. Название файла на Moodle бывает неверным
+            # (файл «ВМ-21,22» может содержать расписание экологов Г-21,22).
+            if not CODE_OK.fullmatch(code):   # кнопки бота и callback_data — только нормальные коды
                 rep["note"] += f" (пропущена странная группа {code[:20]!r})"
                 continue
-            gi = groups.setdefault(code, {
-                "degree": degree, "course": int(re.search(r"-(\d)", code).group(1)) if re.search(r"-(\d)", code) else 1,
-                "program": g["program"], "weeks": {}})
+            gi = groups.setdefault(code, {"degree": degree, "course": int(code.split("-")[1][0]),
+                                          "program": g["program"], "weeks": {}})
             if g["program"]:
                 gi["program"] = g["program"]
-            key = pd.week_start.isoformat()
-            if key in gi["weeks"]:
-                rep["note"] += f" (дубль недели {key} для {code}: берём файл {rid})"
-            lessons = sorted(g["lessons"], key=lambda l: (l["dow"], l["start"], l["room"], l["subject"], l["sub"]))
-            gi["weeks"][key] = {"week_no": pd.week_no, "src": rid, "lessons": lessons}
             rep["groups"].append(code)
+            if not fresh:
+                continue
+            key = pd.week_start.isoformat()
+            # надёжность источника: вручную положенный файл (2) > название на Moodle совпало с группой (1) > остальное (0)
+            rank = 2 if res.get("manual") else (1 if code in title_codes(res["title"]) else 0)
+            if key in gi["weeks"] and gi["weeks"][key].get("rank", 0) > rank:
+                continue
+            lessons = sorted(g["lessons"], key=lambda l: (l["dow"], l["start"], l["room"], l["subject"], l["sub"]))
+            gi["weeks"][key] = {"week_no": pd.week_no, "src": rid, "rank": rank, "lessons": lessons}
             rep["lessons"] += len(lessons)
+    # Группы, которые названы на Moodle, но в самом файле другие (или файла с ними нет): показываем в списке
+    # с пустым расписанием — чтобы студент находил свою группу и видел «расписание ещё не выложено».
+    for res in resources:
+        degree = "master" if "магистр" in res["section"].lower() else "bachelor"
+        for code in title_codes(res["title"]):
+            if not CODE_OK.fullmatch(code) or code in groups:
+                continue
+            if any(g["degree"] == degree and related(code, c) for c, g in groups.items()):
+                continue        # это та же группа под другим названием (ВМ-11 / ВМК-11)
+            groups[code] = {"degree": degree, "course": int(code.split("-")[1][0]), "program": "", "weeks": {}}
+            report.append({"id": res["id"], "title": res["title"], "groups": [code], "lessons": 0,
+                           "note": f"в файле другая группа — {code} добавлена без расписания"})
     return {k: groups[k] for k in sorted(groups)}, report
 
 
@@ -254,6 +296,7 @@ def main() -> int:
     ap.add_argument("--sql", default="out/load.sql")
     ap.add_argument("--today", help="YYYY-MM-DD (для тестов)")
     ap.add_argument("--local-dir", help="папка с .doc/.docx вместо Moodle")
+    ap.add_argument("--manual-dir", default="manual", help="папка с файлами, положенными вручную (приоритетнее Moodle)")
     args = ap.parse_args()
     today = dt.date.fromisoformat(args.today) if args.today else dt.datetime.now(dt.timezone(dt.timedelta(hours=5))).date()
 
@@ -281,6 +324,23 @@ def main() -> int:
                     except Exception as e:  # noqa: BLE001
                         print(f"::warning::не скачался {r['id']} {r['title']}: {e}")
                     time.sleep(0.1)
+        md = Path(args.manual_dir)
+        if md.is_dir() and not args.local_dir:
+            for i, f in enumerate(sorted([*md.glob("*.doc"), *md.glob("*.docx")])):
+                rid = 900001 + i
+                resources.append({"id": rid, "title": f.stem, "url": str(f), "manual": True,
+                                  "section": "Магистратура" if re.search(r"магистр|master", f.stem, re.I) else "Бакалавриат"})
+                blobs[rid] = f.read_bytes()
+                print(f"вручную: {f.name}")
+            for i, f in enumerate(sorted(md.glob("*.json"))):
+                rid = 910001 + i
+                try:
+                    data = json.loads(f.read_text("utf-8"))
+                    resources.append({"id": rid, "title": f.stem, "url": str(f), "manual": True, "json": data,
+                                      "section": "Магистратура" if data.get("degree") == "master" else "Бакалавриат"})
+                    print(f"вручную: {f.name}")
+                except Exception as e:  # noqa: BLE001
+                    print(f"::warning::{f.name}: не удалось прочитать ({e})")
         paths, errors = to_docx(blobs, tmp)
         for r in resources:
             if r["id"] not in blobs:
