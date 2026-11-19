@@ -317,10 +317,10 @@ async function handleCallback(env, cb) {
 }
 
 // ---------------------------------------------------------------- cron
-// Лимит бесплатного плана — 50 подзапросов на запуск. Бюджет: ≤5 SELECT + 1 пакетная отметка + ≤40 отправок + 1 откат.
+// Лимит бесплатного плана — 50 подзапросов на запуск. Бюджет: ≤12 запросов к D1 (из них 2 дешёвые проверки) + 1 пакетная отметка + ≤35 отправок + 1 откат.
 // Если получателей больше, чем помещается в минуту, «ранние» окна (за 16–22 мин до пары, за 61–75 до дня)
 // разбирают очередь партиями; когда народу мало — ждём точного времени.
-const MAX_SENDS = 38;
+const MAX_SENDS = 35;   // 35 отправок + ≤12 запросов к D1 за запуск < 50 подзапросов
 const pick = (cands, T, budget) => {
   const tt = (c) => c.T ?? T;
   const due = cands.filter((c) => c.lead <= tt(c)).sort((a, b) => a.lead - b.lead);
@@ -335,8 +335,18 @@ async function tick(env) {
   let budget = MAX_SENDS;
   const jobs = []; // {chat_id, key, text}
 
+  // Дешёвая проверка, нужны ли тяжёлые запросы про пары: ночью (22:00–07:00) пар нет, а днём — только когда какая-то
+  // пара начнётся через 5–27 мин (напоминание) или 30–75 мин (расписание дня). Читает 1–2 строки по индексу.
+  let g1 = false, g2 = false;
+  if (m >= 7 * 60 && m < 22 * 60) {
+    const g = await env.DB.prepare(
+      `SELECT EXISTS(SELECT 1 FROM cur_lessons WHERE date=?1 AND start_min BETWEEN ?2+5 AND ?2+27) a,
+              EXISTS(SELECT 1 FROM cur_lessons WHERE date=?1 AND start_min BETWEEN ?2+30 AND ?2+75) b`).bind(today, m).first();
+    g1 = !!g?.a; g2 = !!g?.b;
+  }
+
   // 1) за 15 минут до пары (рассылка допускается с 22-й минуты, если очередь большая)
-  {
+  if (g1) {
     const { results } = await env.DB.prepare(
       `SELECT u.chat_id, u.map_pre, l.* FROM users u JOIN cur_lessons l ON l.group_code=u.group_code
        WHERE u.notify=1 AND l.date=?1 AND l.start_min-?2 BETWEEN 5 AND CASE WHEN u.map_pre=1 THEN 27 ELSE 22 END
@@ -355,7 +365,7 @@ async function tick(env) {
   }
 
   // 2) за час до первой пары — расписание на сегодня
-  if (budget > 0) {
+  if (budget > 0 && g2) {
     const { results: us } = await env.DB.prepare(
       `SELECT u.chat_id, u.group_code, x.f FROM users u
        JOIN (SELECT group_code, MIN(start_min) f FROM cur_lessons WHERE date=?1 GROUP BY group_code) x ON x.group_code=u.group_code
@@ -373,20 +383,27 @@ async function tick(env) {
     }
   }
 
-  // 2b) новости и объявления с msu.kz: заголовок + ссылка
+  // 2b) новости и объявления с msu.kz: заголовок + ссылка.
+  // Парсер новостей при появлении свежих записей пишет meta.news_ver; когда всё разослано, бот ставит news_done = news_ver
+  // и больше не трогает таблицы новостей, пока news_ver не изменится. Если news_ver нет (старый парсер) — работаем как раньше.
   if (budget > 0) {
-    const { results } = await env.DB.prepare(
-      `SELECT DISTINCT s.chat_id, n.id, n.feed, n.title, n.url FROM subs s
-         JOIN users u ON u.chat_id=s.chat_id AND u.notify=1
-         JOIN news n ON instr(n.feeds, ','||s.feed||',')>0
-       WHERE n.seen >= s.since AND n.seen >= ?1
-         AND NOT EXISTS (SELECT 1 FROM sent x WHERE x.chat_id=s.chat_id AND x.k='n:'||n.id)
-       ORDER BY n.id LIMIT ?2`).bind(nowSec(env) - NEWS_MAX_AGE, budget).all();
-    for (const r of results) {
-      if (!okUrl(r.url)) continue; // ссылки только на msu.kz
-      jobs.push({ chat_id: r.chat_id, key: "n:" + r.id,
-        text: `${FEEDS[r.feed] || "📰"}\n<b>${esc(r.title)}</b>\n<a href="${esc(r.url)}">Читать на сайте</a>` });
-      budget--;
+    const nm = await env.DB.prepare(
+      "SELECT (SELECT v FROM meta WHERE k='news_ver') nv, (SELECT v FROM meta WHERE k='news_done') nd").first();
+    if (!nm?.nv || nm.nv !== nm.nd) {
+      const { results } = await env.DB.prepare(
+        `SELECT DISTINCT s.chat_id, n.id, n.feed, n.title, n.url FROM subs s
+           JOIN users u ON u.chat_id=s.chat_id AND u.notify=1
+           JOIN news n ON instr(n.feeds, ','||s.feed||',')>0
+         WHERE n.seen >= s.since AND n.seen >= ?1
+           AND NOT EXISTS (SELECT 1 FROM sent x WHERE x.chat_id=s.chat_id AND x.k='n:'||n.id)
+         ORDER BY n.id LIMIT ?2`).bind(nowSec(env) - NEWS_MAX_AGE, budget).all();
+      for (const r of results) {
+        if (!okUrl(r.url)) continue; // ссылки только на msu.kz
+        jobs.push({ chat_id: r.chat_id, key: "n:" + r.id,
+          text: `${FEEDS[r.feed] || "📰"}\n<b>${esc(r.title)}</b>\n<a href="${esc(r.url)}">Читать на сайте</a>` });
+        budget--;
+      }
+      if (!results.length && nm?.nv) await env.DB.prepare("INSERT OR REPLACE INTO meta(k,v) VALUES('news_done',?1)").bind(nm.nv).run();
     }
   }
 
@@ -430,6 +447,11 @@ async function tick(env) {
          AND NOT EXISTS (SELECT 1 FROM sent s WHERE s.chat_id=u.chat_id AND s.k=?1) LIMIT ?2`).bind("bc:" + BROADCAST.id, Math.min(budget, 20)).all();
     for (const u of us) { jobs.push({ chat_id: u.chat_id, key: "bc:" + BROADCAST.id, text: BROADCAST.text, extra: (m < 8 * 60 || m >= 22 * 60) ? { disable_notification: true } : {} }); budget--; }
   }
+  // ночная очистка (раньше стояла после отправок и срабатывала, только если в 04:00 что-то отправлялось)
+  if (m === 4 * 60) {
+    await env.DB.prepare("DELETE FROM sent WHERE k NOT LIKE 'n:%' AND k NOT LIKE 'bc:%' AND k NOT LIKE '%'||?1||'%'").bind(today).run();
+    await env.DB.prepare("DELETE FROM sent WHERE k LIKE 'n:%' AND CAST(substr(k,3) AS INTEGER) IN (SELECT id FROM news WHERE seen < ?1)").bind(nowSec(env) - 7 * 86400).run();
+  }
   if (!jobs.length) return;
   // длинные сообщения (неделя) уходят несколькими частями: не выходим за лимит подзапросов
   let used = 0; const fit = [];
@@ -455,10 +477,6 @@ async function tick(env) {
     }));
   }
   if (undo.length) await env.DB.batch(undo);
-  if (m === 4 * 60) {
-    await env.DB.prepare("DELETE FROM sent WHERE k NOT LIKE 'n:%' AND k NOT LIKE 'bc:%' AND k NOT LIKE '%'||?1||'%'").bind(today).run();
-    await env.DB.prepare("DELETE FROM sent WHERE k LIKE 'n:%' AND CAST(substr(k,3) AS INTEGER) IN (SELECT id FROM news WHERE seen < ?1)").bind(nowSec(env) - 7 * 86400).run();
-  }
 }
 
 export default {
