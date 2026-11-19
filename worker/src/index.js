@@ -131,7 +131,7 @@ async function groupKeyboard(env, course) {
   if (!results.length) return null;
   const rows = []; let row = [];
   for (const g of results) {
-    row.push({ text: g.code, callback_data: "g:" + g.code });
+    row.push({ text: /^ВМК-\d+$/.test(g.code) ? `${g.code} (ВМ-${g.code.slice(4)})` : g.code, callback_data: "g:" + g.code });
     if (row.length === 3) { rows.push(row); row = []; }
   }
   if (row.length) rows.push(row);
@@ -142,6 +142,29 @@ async function subsKeyboard(env, chat) {
   const { results } = await env.DB.prepare("SELECT feed FROM subs WHERE chat_id=?1").bind(chat).all();
   const on = new Set(results.map((r) => r.feed));
   return { inline_keyboard: Object.entries(FEEDS).map(([k, name]) => [{ text: (on.has(k) ? "✅ " : "⬜ ") + name, callback_data: "s:" + k }]) };
+}
+// Статистика по направлениям: считаем только количество людей по префиксу кода группы (М-21 -> «М»)
+const FACULTY_NAME = { mm: "Мехмат", vmk: "ВМК", pmim: "ПМиМ", eco: "Экология", econ: "Экономика", phil: "Филология", other: "Другие" };
+const FACULTY_OF = { "М": "mm", "ВМ": "vmk", "ВМК": "vmk", "ПМИМ": "pmim", "Г": "eco", "ГМ": "eco", "Э": "econ", "ЭМ": "econ", "Ф": "phil", "ФМ": "phil" };
+async function statsText(env) {
+  const { results } = await env.DB.prepare(
+    `SELECT u.group_code, g.degree, COUNT(*) c FROM users u LEFT JOIN groups g ON g.code=u.group_code
+     WHERE u.group_code IS NOT NULL GROUP BY u.group_code, g.degree`).all();
+  const lv = { bachelor: {}, master: {} }; const tot = { bachelor: 0, master: 0 };
+  for (const r of results) {
+    const pre = String(r.group_code).split("-")[0].toUpperCase();
+    const deg = r.degree ? (r.degree === "master" ? "master" : "bachelor") : (MASTER_PREFIX.has(pre) ? "master" : "bachelor");
+    const f = FACULTY_OF[pre] || "other";
+    lv[deg][f] = (lv[deg][f] || 0) + r.c; tot[deg] += r.c;
+  }
+  const medals = ["🥇", "🥈", "🥉"];
+  const block = (deg, title) => {
+    const rows = Object.entries(lv[deg]).sort((a, b) => b[1] - a[1] || (a[0] === "other") - (b[0] === "other"))
+      .slice(0, 3).map(([f, c], i) => `${medals[i]} ${FACULTY_NAME[f]} — ${c}`);   // только первые три места
+    return rows.length ? `<b>${title}</b> (${tot[deg]})\n${rows.join("\n")}` : "";
+  };
+  return `📊 <b>Итоги недели</b>\nПользователей Мудлика: <b>${tot.bachelor + tot.master}</b>\n\n` +
+    [block("bachelor", "🎓 Бакалавриат"), block("master", "🎓 Магистратура")].filter(Boolean).join("\n\n");
 }
 const SUBS_TEXT = "Выберите, о чём присылать короткие уведомления (заголовок + ссылка на сайт msu.kz). Нажатие включает/выключает раздел:";
 
@@ -187,6 +210,9 @@ const INFO_TEXT = `<b>Что умеет Мудлик</b>
 <b>Новости и объявления</b>
 /news — выберите, какие разделы сайта msu.kz вам интересны: объявления, новости, конференции и семинары, гостевые лекции, олимпиады, школы юных МГУ. По умолчанию включены только «Объявления». Приходит короткий заголовок и ссылка на сайт.
 
+<b>Итоги недели</b>
+Каждое воскресенье около 13:00 бот присылает, сколько пользователей по направлениям отдельно в бакалавриате и магистратуре.
+
 <b>Актуальность</b>
 Расписание обновляется раз в день, вечером в 20:00. Внизу каждого ответа указана дата последнего обновления и следующего. Если расписание изменилось в течение дня, напишите нам через /support, мы обновим вручную.
 
@@ -195,24 +221,9 @@ const INFO_TEXT = `<b>Что умеет Мудлик</b>
 
 Бот работает только в личных сообщениях.`;
 
-// Разовая рассылка всем пользователям (по одному разу на id). Чтобы разослать новое — поменяйте id и текст.
-// Идёт на остаток лимита (ночью — без звука), поэтому не мешает напоминаниям.
-const UPDATE_TEXT = `🆕 <b>Первое обновление Мудлика</b>
-Всем большое спасибо, что пользуетесь ботом и помогаете сделать его лучше! В этом обновлении добавлено:
-
-🗺 <b>Карты кабинетов</b>
-Команда /room 507 (или любой другой кабинет 5–7 этажа) присылает карту этажа с отмеченным кабинетом. Карты есть для блока B, 5–7 этажи.
-
-🔔 <b>Карта перед парой</b>
-В /notify можно включить «Карта кабинета за 20 минут до пары»: бот пришлёт фото с пометкой, где будет пара, и сразу время, кабинет и преподавателя. По умолчанию выключено.
-
-🕗 <b>Расписание теперь обновляется раз в день, вечером в 20:00</b>
-В конце каждого ответа указана дата последнего обновления и следующего. Новости с сайта проверяются в 8:00 и 20:00, расписание на следующую неделю приходит в воскресенье в 20:30.
-
-⚠️ Если расписание в боте не совпадает с настоящим, напишите @aitufmstaff и пришлите фото или файл актуального расписания. Обновим вручную.
-
-Все команды и их краткое описание: /info`;
-const BROADCAST = { id: "upd1", text: UPDATE_TEXT };
+// Разовая рассылка всем пользователям (по одному разу на id). Чтобы разослать новое — задайте
+// const BROADCAST = { id: "upd2", text: `...` }; (новый id), задеплойте, а после рассылки верните null.
+const BROADCAST = null;
 
 async function handleMessage(env, msg) {
   const chat = msg.chat.id;
@@ -222,6 +233,7 @@ async function handleMessage(env, msg) {
   const text = (msg.text || "").trim();
   const cmd = text.split(/[\s@]/)[0].toLowerCase();
   if (cmd === "/info" || cmd === "/help") return send(env, chat, INFO_TEXT, { reply_markup: supportKb });
+  if (cmd === "/stats") return send(env, chat, await statsText(env));
   if (cmd === "/support") return send(env, chat, "Возник вопрос или нашли ошибку в расписании? Напишите нам:", { reply_markup: supportKb });
   if (cmd === "/start" || cmd === "/group") return chooseGroup(env, chat);
   const u = await userGroup(env, chat);
@@ -391,6 +403,16 @@ async function tick(env) {
         .bind(mon, sat, ...gs).all();
       const byG = groupBy(results, (r) => r.group_code);
       for (const u of us) jobs.push({ chat_id: u.chat_id, key: "sun:" + today, text: rangeFromRows(u.group_code, byG.get(u.group_code) || [], "🗓 Расписание на неделю") });
+    }
+  }
+  // 3b) воскресенье 13:00–14:00 — итоги недели (статистика по направлениям)
+  if (budget > 0 && d.getUTCDay() === 0 && m >= 13 * 60 && m < 14 * 60) {
+    const { results: us } = await env.DB.prepare(
+      `SELECT u.chat_id FROM users u WHERE u.notify=1 AND u.group_code IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM sent s WHERE s.chat_id=u.chat_id AND s.k='stat:'||?1) LIMIT ?2`).bind(today, Math.min(budget, 20)).all();
+    if (us.length) {
+      const text = await statsText(env);
+      for (const u of us) { jobs.push({ chat_id: u.chat_id, key: "stat:" + today, text }); budget--; }
     }
   }
   // 4) понедельник 08:00–08:30 — пожелание удачной недели
