@@ -205,7 +205,8 @@ def parse_cell(text: str) -> list[Lesson]:
             cur.subject = (cur.subject + " " + subj_part).strip()
         _take_teacher(cur, after)
     flush()
-    return [x for x in out if x.subject]
+    # мусорные ячейки без единой буквы («0», «-», «.») парами не считаем
+    return [x for x in out if x.subject and re.search(r"[A-Za-zА-Яа-яЁё]", x.subject)]
 
 
 # ----------------------------------------------------------- the document
