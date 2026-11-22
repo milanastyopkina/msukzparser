@@ -99,15 +99,24 @@ function dayFromRows(group, date, rows, title) {
   return `${head}\n\n` + rows.map((l) => lessonLine(l)).join("\n\n");
 }
 function rangeFromRows(group, rows, title) {
-  if (!rows.length) return `${title} · ${esc(group)}\nЗанятий в этот период нет (или расписание ещё не выложено).`;
+  if (!rows.length) return `${title} · ${esc(group)}\nРасписание на эту неделю пока не найдено на Moodle. Как только оно появится, оно будет здесь.`;
   const by = {};
   for (const l of rows) (by[l.date] ||= []).push(l);
   return `${title} · ${esc(group)}\n\n` + Object.keys(by).map((d) =>
     `<b>${fmtDate(d)}</b>\n` + by[d].map((l) => lessonLine(l)).join("\n")).join("\n\n");
 }
+const monOf = (s) => { const d = new Date(s + "T00:00:00Z"); return iso(addDays(d, -((d.getUTCDay() + 6) % 7))); };
+const NO_WEEK = "Расписание на эту неделю не найдено на Moodle, поэтому бот не знает, есть ли пары. " +
+  "Если у вас есть занятия — напишите в /support и пришлите фото или файл расписания.";
 async function dayText(env, group, date, title) {
   const { results } = await env.DB.prepare(
     "SELECT * FROM cur_lessons WHERE group_code=?1 AND date=?2 ORDER BY start_min, sub").bind(group, date).all();
+  if (!results.length && !fmtDate(date).startsWith("Вс")) {
+    const mon = monOf(date);
+    const any = await env.DB.prepare("SELECT 1 FROM cur_lessons WHERE group_code=?1 AND date BETWEEN ?2 AND ?3 LIMIT 1")
+      .bind(group, mon, iso(addDays(new Date(mon + "T00:00:00Z"), 5))).first();
+    if (!any) return `${title} <b>${fmtDate(date)}</b> · ${esc(group)}\n${NO_WEEK}`;
+  }
   return dayFromRows(group, date, results, title);
 }
 async function rangeText(env, group, from, days, title) {
@@ -257,7 +266,12 @@ async function handleMessage(env, msg) {
   if (cmd === "/today") return reply(env, chat, await dayText(env, g, today, "📅 Сегодня"));
   if (cmd === "/tomorrow") return reply(env, chat, await dayText(env, g, iso(addDays(nowLocal(env), 1)), "📅 Завтра"));
   if (cmd === "/week") {
-    const d = nowLocal(env); const mon = addDays(d, -((d.getUTCDay() + 6) % 7));
+    const d = nowLocal(env);
+    if (d.getUTCDay() === 0) {   // в воскресенье «эта неделя» уже прошла — показываем наступающую
+      const mon = addDays(d, 1);
+      return reply(env, chat, await rangeText(env, g, iso(mon), 6, `🗓 Неделя с ${fmtDate(iso(mon)).slice(3)}`));
+    }
+    const mon = addDays(d, -((d.getUTCDay() + 6) % 7));
     return reply(env, chat, await rangeText(env, g, iso(mon), 6, "🗓 Эта неделя"));
   }
   if (cmd === "/nextweek") {
@@ -416,8 +430,15 @@ async function tick(env) {
     }
   }
 
-  // 3) воскресенье 20:30–21:30 — расписание следующей недели (после вечернего обновления в 20:00)
-  if (budget > 0 && d.getUTCDay() === 0 && m >= 20 * 60 + 30 && m < 21 * 60 + 30) {
+  // 3) воскресенье 20:30–22:30 — расписание следующей недели. Ждём, пока вечернее обновление реально пройдёт
+  // (GitHub Actions опаздывает на 5–40 мин); если к 22:00 его так и нет — шлём то, что есть.
+  let sunOk = false;
+  if (budget > 0 && d.getUTCDay() === 0 && m >= 20 * 60 + 30 && m < 22 * 60 + 30) {
+    const ck = await env.DB.prepare("SELECT v FROM meta WHERE k='checked'").first();
+    const c = ck?.v ? new Date(Date.parse(ck.v) + TZ) : null;
+    sunOk = m >= 22 * 60 || (c && iso(c) === today && c.getUTCHours() >= UPDATE_HOUR - 1);
+  }
+  if (sunOk) {
     const { results: us } = await env.DB.prepare(
       `SELECT u.chat_id, u.group_code FROM users u WHERE u.notify=1 AND u.group_code IS NOT NULL
          AND NOT EXISTS (SELECT 1 FROM sent s WHERE s.chat_id=u.chat_id AND s.k='sun:'||?1) LIMIT ?2`).bind(today, budget).all();
@@ -428,7 +449,7 @@ async function tick(env) {
         `SELECT * FROM cur_lessons WHERE date BETWEEN ?1 AND ?2 AND group_code IN (${gs.map((_, i) => "?" + (i + 3)).join(",")}) ORDER BY date, start_min, sub`)
         .bind(mon, sat, ...gs).all();
       const byG = groupBy(results, (r) => r.group_code);
-      for (const u of us) jobs.push({ chat_id: u.chat_id, key: "sun:" + today, text: rangeFromRows(u.group_code, byG.get(u.group_code) || [], "🗓 Расписание на неделю") });
+      for (const u of us) { jobs.push({ chat_id: u.chat_id, key: "sun:" + today, text: rangeFromRows(u.group_code, byG.get(u.group_code) || [], "🗓 Расписание на неделю") }); budget--; }
     }
   }
   // 3b) воскресенье 13:00–14:00 — итоги недели (статистика по направлениям)
