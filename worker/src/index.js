@@ -131,8 +131,8 @@ async function rangeText(env, group, from, days, title) {
   return rangeFromRows(group, results, title);
 }
 
-// Парсер Moodle запускается один раз в день вечером (см. sync.yml, ~19:50–20:00 по Астане): по просьбе техотдела вуза
-const UPDATE_HOUR = 20;
+// Парсер Moodle запускается один раз в день вечером (см. sync.yml, ~18:50–19:00 по Астане): по просьбе техотдела вуза
+const UPDATE_HOUR = 19;
 const MON_GEN = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"];
 const dayMonth = (s) => `${+s.slice(8)} ${MON_GEN[+s.slice(5, 7) - 1]}`;
 async function freshness(env) {
@@ -143,7 +143,7 @@ async function freshness(env) {
   // сегодняшнее обновление ещё впереди (или как раз идёт) -> «сегодня», иначе -> завтра
   const todayAhead = nm < UPDATE_HOUR * 60 || (iso(c) < iso(n) && nm < (UPDATE_HOUR + 1) * 60);
   const nextDay = todayAhead ? iso(n) : iso(addDays(n, 1));
-  // «на 20:00» пишем, только если проверка была в вечернее окно; внеплановая (ручной запуск, задержка Actions) — просто дата
+  // «на 19:00» пишем, только если проверка была в вечернее окно; внеплановая (ручной запуск, задержка Actions) — просто дата
   const when = c.getUTCHours() >= UPDATE_HOUR - 1 ? `актуально на ${UPDATE_HOUR}:00, ${dayMonth(iso(c))}` : `обновлено ${dayMonth(iso(c))}`;
   return `\n\n🕒 <i>Расписание ${when}. Следующее обновление: ${dayMonth(nextDay)} в ${UPDATE_HOUR}:00.</i>`;
 }
@@ -237,7 +237,7 @@ const INFO_TEXT = `<b>Что умеет Мудлик</b>
 Каждое воскресенье около 13:00 бот присылает, сколько пользователей по направлениям отдельно в бакалавриате и магистратуре.
 
 <b>Актуальность</b>
-Расписание обновляется раз в день, вечером в 20:00. Внизу каждого ответа указана дата последнего обновления и следующего. Если расписание изменилось в течение дня, напишите нам через /support, мы обновим вручную.
+Расписание обновляется раз в день, вечером в ${UPDATE_HOUR}:00. Внизу каждого ответа указана дата последнего обновления и следующего. Если расписание изменилось в течение дня, напишите нам через /support, мы обновим вручную.
 
 <b>Поддержка</b>
 /support — написать нам, если нашли ошибку. Приложите фото или файл настоящего расписания, мы обновим его вручную.
@@ -358,10 +358,35 @@ const pick = (cands, T, budget) => {
 };
 const groupBy = (rows, f) => { const m = new Map(); for (const r of rows) { const k = f(r); (m.get(k) || m.set(k, []).get(k)).push(r); } return m; };
 
+// Запуск вечернего обновления из Cloudflare. Расписание GitHub Actions опаздывает на 4–7 часов, а крон воркера точен.
+// За 15 минут до часа обновления и ещё два часа, пока сегодня не было проверки в вечернее окно, просим GitHub запустить sync (повтор не чаще раза в 25 мин).
+// Нужен секрет GH_TOKEN (fine-grained токен с правом Actions: write на этот репозиторий); без него функция молча выключена.
+const GH_REPO = "milanastyopkina/msukzparser";
+async function kickSync(env, m, today) {
+  if (!env.GH_TOKEN || m < UPDATE_HOUR * 60 - 15 || m >= UPDATE_HOUR * 60 + 105) return;
+  const { results } = await env.DB.prepare("SELECT k, v FROM meta WHERE k IN ('checked','sync_try')").all();
+  const meta = Object.fromEntries(results.map((r) => [r.k, r.v]));
+  const c = meta.checked ? new Date(Date.parse(meta.checked) + TZ) : null;
+  if (c && iso(c) === today && c.getUTCHours() >= UPDATE_HOUR - 1) return;     // уже проверено сегодня вечером
+  const [day, at] = (meta.sync_try || "").split("|");
+  if (day === today && m - Number(at) < 25) return;                              // недавно уже просили
+  await env.DB.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('sync_try', ?1)").bind(`${today}|${m}`).run();
+  try {
+    const r = await fetch(`https://api.github.com/repos/${GH_REPO}/actions/workflows/sync.yml/dispatches`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${env.GH_TOKEN}`, Accept: "application/vnd.github+json", "User-Agent": "msu-schedule-bot",
+        "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json" },
+      body: JSON.stringify({ ref: "main" }),
+    });
+    if (r.status !== 204) console.log("kickSync: GitHub ответил", r.status, (await r.text()).slice(0, 200));
+  } catch (e) { console.log("kickSync: ошибка", String(e)); }
+}
+
 async function tick(env) {
   const d = nowLocal(env), today = iso(d), m = d.getUTCHours() * 60 + d.getUTCMinutes();
   let budget = MAX_SENDS;
   const jobs = []; // {chat_id, key, text}
+  await kickSync(env, m, today);
 
   // Дешёвая проверка, нужны ли тяжёлые запросы про пары: ночью (22:00–07:00) пар нет, а днём — только когда какая-то
   // пара начнётся через 5–27 мин (напоминание) или 30–75 мин (расписание дня). Читает 1–2 строки по индексу.
