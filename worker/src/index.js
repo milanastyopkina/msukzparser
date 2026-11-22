@@ -133,6 +133,7 @@ async function rangeText(env, group, from, days, title) {
 
 // Парсер Moodle запускается один раз в день вечером (см. sync.yml, ~18:50–19:00 по Астане): по просьбе техотдела вуза
 const UPDATE_HOUR = 19;
+const JOKE_HOUR = 9;          // во сколько приходит анекдот дня
 const MON_GEN = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"];
 const dayMonth = (s) => `${+s.slice(8)} ${MON_GEN[+s.slice(5, 7) - 1]}`;
 async function freshness(env) {
@@ -193,10 +194,11 @@ const SUBS_TEXT = "Выберите, о чём присылать коротки
 
 const NOTIFY_TEXT = "Настройки уведомлений. Нажатие включает или выключает пункт:";
 async function notifyKeyboard(env, chat) {
-  const u = await env.DB.prepare("SELECT notify, map_pre FROM users WHERE chat_id=?1").bind(chat).first();
+  const u = await env.DB.prepare("SELECT notify, map_pre, jokes FROM users WHERE chat_id=?1").bind(chat).first();
   return { inline_keyboard: [
     [{ text: (u?.notify ? "🔔 Уведомления: вкл" : "🔕 Уведомления: выкл"), callback_data: "n:t" }],
-    [{ text: (u?.map_pre ? "✅ " : "⬜ ") + `Карта кабинета за ${MAP_LEAD} мин до пары`, callback_data: "n:m" }] ] };
+    [{ text: (u?.map_pre ? "✅ " : "⬜ ") + `Карта кабинета за ${MAP_LEAD} мин до пары`, callback_data: "n:m" }],
+    [{ text: (u?.jokes === 1 ? "✅ " : "⬜ ") + `Анекдот дня в ${JOKE_HOUR}:00`, callback_data: "n:j" }] ] };
 }
 
 async function userGroup(env, chat) {
@@ -233,6 +235,9 @@ const INFO_TEXT = `<b>Что умеет Мудлик</b>
 <b>Новости и объявления</b>
 /news — выберите, какие разделы сайта msu.kz вам интересны: объявления, новости, конференции и семинары, гостевые лекции, олимпиады, школы юных МГУ. По умолчанию включены только «Объявления». Приходит короткий заголовок и ссылка на сайт.
 
+<b>Анекдот дня</b>
+Каждое утро в ${JOKE_HOUR}:00 — один анекдот (включить и выключить: /notify). Последний можно открыть командой /joke.
+
 <b>Итоги недели</b>
 Каждое воскресенье около 13:00 бот присылает, сколько пользователей по направлениям отдельно в бакалавриате и магистратуре.
 
@@ -248,6 +253,73 @@ const INFO_TEXT = `<b>Что умеет Мудлик</b>
 // const BROADCAST = { id: "upd2", text: `...` }; (новый id), задеплойте, а после рассылки верните null.
 const BROADCAST = null;
 
+// ---------------------------------------------------------------- Анекдот дня
+// Раз в сутки в 9:00 присылаем один анекдот из «Лучших анекдотов дня» (там лучшее за вчера). Только тем, кто согласился (users.jokes=1).
+// Всем остальным один раз приходит вопрос с кнопками «Да/Нет»; без ответа (jokes IS NULL) человек просто ничего не получает,
+// а остальные уведомления идут как обычно. Рассылка использует только остаток лимита отправок и не мешает расписанию.
+const JOKE_URL = "https://anekdotov.net/anekdot/day/";
+const JOKE_ASK_FROM = 11 * 60, JOKE_ASK_TO = 20 * 60;           // когда задаём вопрос (после утренних рассылок)
+const JOKE_ASK_TEXT = "😄 <b>Хотите получать анекдот дня?</b>\n\nКаждое утро в 9:00 — один анекдот. Передумать можно в любой момент в /notify.";
+const JOKE_KB = { inline_keyboard: [
+  [{ text: "✅ Да, хочу", callback_data: "j:1" }],
+  [{ text: "🚫 Не хочу получать такого рода уведомления", callback_data: "j:x" }],
+  [{ text: "❌ Нет, спасибо", callback_data: "j:0" }] ] };
+// Простой фильтр: мат и совсем откровенные темы пропускаем (берём следующий анекдот). Список можно дополнять.
+const JOKE_BAD = /х[уy][йеёяию]|пизд|бляд|бля[тд]ь|пидор|пидр|мудак|залуп|гандон|[её]б(?:ать|ан[аоуыи]?|ал[аио]?|аш|ну[лт]|ун)|проститутк|шлюх|сиськ|трахат|трахн|секс/i;
+
+function jokeText(text) { return `😄 <b>Анекдот дня</b>\n\n${esc(text)}\n\n<i>anekdotov.net</i>`; }
+
+// Страница «Лучшие анекдоты дня»: сверху лучший анекдот вчерашнего дня, ниже — лучшие за эту же дату прошлых лет.
+// Каждый анекдот: <b>дата</b></font>:</div> <div class="anekdot"><p> …текст… </p></div>
+const ENT = { nbsp: " ", quot: '"', amp: "&", lt: "<", gt: ">", laquo: "«", raquo: "»", mdash: "—", ndash: "–", hellip: "…", apos: "'" };
+function htmlText(x) {
+  return x.replace(/<br\s*\/?>/gi, "\n").replace(/<[^>]+>/g, "")
+    .replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (m, e) => {
+      if (e[0] === "#") { const n = e[1].toLowerCase() === "x" ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10); return n > 0 && n < 0x110000 ? String.fromCodePoint(n) : ""; }
+      return ENT[e.toLowerCase()] ?? m;
+    })
+    .replace(/[ \t\r\f\v\u00a0]+/g, " ").replace(/ *\n */g, "\n").trim();
+}
+function parseJokes(html) {
+  const out = [];
+  const re = /<div class="anekdot">\s*<p>([\s\S]*?)<\/p>\s*<\/div>/gi;
+  for (let m; (m = re.exec(html)); ) { const t = htmlText(m[1]); if (t) out.push(t); }
+  return out;
+}
+// Первый подходящий анекдот (самый свежий сверху); уже присылавшиеся (seen) и неподходящие пропускаем.
+function pickJoke(list, seen = new Set()) {
+  for (const t of list) {
+    if (t.length >= 30 && t.length <= 900 && !JOKE_BAD.test(t) && !seen.has(t)) return t;
+  }
+  return null;
+}
+async function fetchJoke(seen) {
+  try {
+    const r = await fetch(JOKE_URL, { headers: { "User-Agent": "Mozilla/5.0 (compatible; MudlikBot/1.0; +https://t.me/msu_kz_moodle_bot)" },
+      signal: AbortSignal.timeout(8000) });
+    if (!r.ok) return null;
+    const buf = await r.arrayBuffer();
+    const ct = r.headers.get("content-type") || "";
+    const head = new TextDecoder("latin1").decode(buf.slice(0, 2048));
+    const cs = (ct.match(/charset=([\w-]+)/i) || head.match(/charset=["']?([\w-]+)/i) || [])[1] || "utf-8";
+    let html; try { html = new TextDecoder(cs).decode(buf); } catch { html = new TextDecoder("utf-8").decode(buf); }
+    return pickJoke(parseJokes(html), seen);
+  } catch { return null; }
+}
+// Берём анекдот на сегодня (один запрос к сайту в сутки; при неудаче повтор не чаще раза в 10 минут до 10:30).
+async function ensureJoke(env, today, m) {
+  if (m < JOKE_HOUR * 60 - 5 || m >= 10 * 60 + 30) return;
+  const have = await env.DB.prepare("SELECT 1 FROM jokes WHERE day=?1").bind(today).first();
+  if (have) return;
+  const t = await env.DB.prepare("SELECT v FROM meta WHERE k='joke_try'").first();
+  const [day, at] = (t?.v || "").split("|");
+  if (day === today && m - Number(at) < 10) return;
+  await env.DB.prepare("INSERT OR REPLACE INTO meta (k,v) VALUES ('joke_try', ?1)").bind(`${today}|${m}`).run();
+  const { results: prev } = await env.DB.prepare("SELECT text FROM jokes ORDER BY day DESC LIMIT 60").all();
+  const j = await fetchJoke(new Set(prev.map((r) => r.text)));
+  if (j) await env.DB.prepare("INSERT OR IGNORE INTO jokes (day, text) VALUES (?1, ?2)").bind(today, j).run();
+}
+
 async function handleMessage(env, msg) {
   const chat = msg.chat.id;
   const fl = flood(chat);
@@ -257,6 +329,10 @@ async function handleMessage(env, msg) {
   const cmd = text.split(/[\s@]/)[0].toLowerCase();
   if (cmd === "/info" || cmd === "/help") return send(env, chat, INFO_TEXT, { reply_markup: supportKb });
   if (cmd === "/stats") return send(env, chat, await statsText(env));
+  if (cmd === "/joke" || cmd === "/anekdot") {
+    const j = await env.DB.prepare("SELECT text FROM jokes ORDER BY day DESC LIMIT 1").first();
+    return send(env, chat, j ? jokeText(j.text) : "Анекдотов пока нет. Загляните завтра после 9:00.");
+  }
   if (cmd === "/support") return send(env, chat, "Возник вопрос или нашли ошибку в расписании? Напишите нам:", { reply_markup: supportKb });
   if (cmd === "/start" || cmd === "/group") return chooseGroup(env, chat);
   const u = await userGroup(env, chat);
@@ -308,7 +384,7 @@ async function handleMessage(env, msg) {
     return send(env, chat, NOTIFY_TEXT, { reply_markup: await notifyKeyboard(env, chat) });
   }
   return send(env, chat,
-    `Ваша группа: <b>${esc(g)}</b>\n\n/today — сегодня\n/tomorrow — завтра\n/week — неделя\n/nextweek — следующая неделя\n/next — ближайшая пара\n/group — сменить группу\n/news — подписка на новости и объявления\n/notify — настройки уведомлений\n/room 507 — карта кабинета\n/support — написать в поддержку`, { reply_markup: supportKb });
+    `Ваша группа: <b>${esc(g)}</b>\n\n/today — сегодня\n/tomorrow — завтра\n/week — неделя\n/nextweek — следующая неделя\n/next — ближайшая пара\n/group — сменить группу\n/news — подписка на новости и объявления\n/notify — настройки уведомлений\n/room 507 — карта кабинета\n/joke — анекдот дня\n/support — написать в поддержку`, { reply_markup: supportKb });
 }
 
 async function handleCallback(env, cb) {
@@ -325,10 +401,20 @@ async function handleCallback(env, cb) {
     else await env.DB.prepare("INSERT INTO subs(chat_id,feed,since) VALUES(?1,?2,?3)").bind(chat, feed, nowSec(env)).run();
     return tg(env, "editMessageReplyMarkup", { chat_id: chat, message_id: cb.message.message_id, reply_markup: await subsKeyboard(env, chat) });
   }
-  if (cb.data === "n:t" || cb.data === "n:m") {
+  if (cb.data === "j:1" || cb.data === "j:0" || cb.data === "j:x") {
+    const yes = cb.data === "j:1", never = cb.data === "j:x";
+    await tg(env, "answerCallbackQuery", { callback_query_id: cb.id, text: yes ? "Договорились!" : "Хорошо, не будем" });
+    // fun_off=1 — человек не хочет никаких развлекательных рассылок (анекдоты и всё подобное): больше такого не предлагаем
+    await env.DB.prepare("UPDATE users SET jokes=?2, fun_off=?3 WHERE chat_id=?1").bind(chat, yes ? 1 : 0, never ? 1 : 0).run();
+    return tg(env, "editMessageText", { chat_id: chat, message_id: cb.message.message_id, parse_mode: "HTML",
+      text: yes ? `✅ Готово! Каждое утро в ${JOKE_HOUR}:00 будем присылать анекдот дня. Выключить можно в /notify.`
+        : never ? "Хорошо, развлекательные уведомления присылать и предлагать не будем. Расписание и напоминания продолжат приходить как обычно. Передумаете — включите анекдоты в /notify."
+        : "Хорошо, анекдоты присылать не будем. Передумаете — включите в /notify." });
+  }
+  if (cb.data === "n:t" || cb.data === "n:m" || cb.data === "n:j") {
     await tg(env, "answerCallbackQuery", { callback_query_id: cb.id });
-    const col = cb.data === "n:t" ? "notify" : "map_pre";
-    await env.DB.prepare(`UPDATE users SET ${col} = 1 - COALESCE(${col},0) WHERE chat_id=?1`).bind(chat).run();
+    const col = cb.data === "n:t" ? "notify" : cb.data === "n:m" ? "map_pre" : "jokes";
+    await env.DB.prepare(`UPDATE users SET ${col} = 1 - COALESCE(${col},0)${col === "jokes" ? ", fun_off = 0" : ""} WHERE chat_id=?1`).bind(chat).run();
     return tg(env, "editMessageReplyMarkup", { chat_id: chat, message_id: cb.message.message_id, reply_markup: await notifyKeyboard(env, chat) });
   }
   if (cb.data?.startsWith("g:")) {
@@ -507,9 +593,35 @@ async function tick(env) {
          AND NOT EXISTS (SELECT 1 FROM sent s WHERE s.chat_id=u.chat_id AND s.k=?1) LIMIT ?2`).bind("bc:" + BROADCAST.id, Math.min(budget, 20)).all();
     for (const u of us) { jobs.push({ chat_id: u.chat_id, key: "bc:" + BROADCAST.id, text: BROADCAST.text, extra: (m < 8 * 60 || m >= 22 * 60) ? { disable_notification: true } : {} }); budget--; }
   }
+  // 6) анекдот дня (самый низкий приоритет: только остаток лимита отправок)
+  if (m >= JOKE_HOUR * 60 - 5 && m < 11 * 60) await ensureJoke(env, today, m);
+  if (budget > 0 && m >= JOKE_HOUR * 60 && m < 11 * 60) {
+    const done = await env.DB.prepare("SELECT v FROM meta WHERE k='jk_done'").first();
+    if (done?.v !== today) {
+      const j = await env.DB.prepare("SELECT text FROM jokes WHERE day=?1").bind(today).first();
+      if (j) {
+        const { results: us } = await env.DB.prepare(
+          `SELECT u.chat_id FROM users u WHERE u.notify=1 AND u.jokes=1
+             AND NOT EXISTS (SELECT 1 FROM sent s WHERE s.chat_id=u.chat_id AND s.k='jk:'||?1) LIMIT ?2`).bind(today, Math.min(budget, 20)).all();
+        for (const u of us) { jobs.push({ chat_id: u.chat_id, key: "jk:" + today, text: jokeText(j.text) }); budget--; }
+        if (!us.length) await env.DB.prepare("INSERT OR REPLACE INTO meta (k,v) VALUES ('jk_done', ?1)").bind(today).run();
+      }
+    }
+  }
+  // 7) один раз спросить всех, хотят ли они анекдоты (днём, после утренних рассылок; без ответа ничего не блокируется)
+  if (budget > 0 && m >= JOKE_ASK_FROM && m < JOKE_ASK_TO) {
+    const done = await env.DB.prepare("SELECT v FROM meta WHERE k='jq_done'").first();
+    if (done?.v !== today) {
+      const { results: us } = await env.DB.prepare(
+        `SELECT u.chat_id FROM users u WHERE u.notify=1 AND u.jokes IS NULL AND COALESCE(u.fun_off,0)=0
+           AND NOT EXISTS (SELECT 1 FROM sent s WHERE s.chat_id=u.chat_id AND s.k='jq') LIMIT ?1`).bind(Math.min(budget, 20)).all();
+      for (const u of us) { jobs.push({ chat_id: u.chat_id, key: "jq", text: JOKE_ASK_TEXT, extra: { reply_markup: JOKE_KB } }); budget--; }
+      if (!us.length) await env.DB.prepare("INSERT OR REPLACE INTO meta (k,v) VALUES ('jq_done', ?1)").bind(today).run();
+    }
+  }
   // ночная очистка (раньше стояла после отправок и срабатывала, только если в 04:00 что-то отправлялось)
   if (m === 4 * 60) {
-    await env.DB.prepare("DELETE FROM sent WHERE k NOT LIKE 'n:%' AND k NOT LIKE 'bc:%' AND k NOT LIKE '%'||?1||'%'").bind(today).run();
+    await env.DB.prepare("DELETE FROM sent WHERE k NOT LIKE 'n:%' AND k NOT LIKE 'bc:%' AND k <> 'jq' AND k NOT LIKE '%'||?1||'%'").bind(today).run();
     await env.DB.prepare("DELETE FROM sent WHERE k LIKE 'n:%' AND CAST(substr(k,3) AS INTEGER) IN (SELECT id FROM news WHERE seen < ?1)").bind(nowSec(env) - 7 * 86400).run();
   }
   if (!jobs.length) return;
@@ -552,7 +664,7 @@ export default {
         { command: "today", description: "Расписание на сегодня" }, { command: "tomorrow", description: "На завтра" },
         { command: "week", description: "На неделю" }, { command: "nextweek", description: "Следующая неделя" },
         { command: "next", description: "Ближайшая пара" }, { command: "group", description: "Сменить группу" },
-        { command: "news", description: "Подписка на новости и объявления" }, { command: "notify", description: "Настройки уведомлений" }, { command: "room", description: "Карта кабинета: /room 507" }, { command: "info", description: "Что умеет бот" }, { command: "support", description: "Написать в поддержку" }] });
+        { command: "news", description: "Подписка на новости и объявления" }, { command: "notify", description: "Настройки уведомлений" }, { command: "room", description: "Карта кабинета: /room 507" }, { command: "joke", description: "Анекдот дня" }, { command: "info", description: "Что умеет бот" }, { command: "support", description: "Написать в поддержку" }] });
       return Response.json({ setWebhook: a, setMyCommands: b });
     }
     if (req.method === "POST" && url.pathname === "/webhook") {
