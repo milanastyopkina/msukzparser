@@ -408,7 +408,9 @@ def parse_docx(path: str, fallback_codes: list[str] | None = None) -> ParsedDoc:
                     continue
                 for les in parse_cell(txt):
                     targets = codes_here
-                    if les.grp:
+                    # спецсеминары («С/с …») выбирают по интересу, а не по группе: показываем всем группам потока,
+                    # даже если в ячейке стоит пометка «Ф-21(1)»
+                    if les.grp and not re.match(r"\s*с\s*/\s*с\b", les.subject, re.I):
                         if les.grp in codes_here:
                             targets = [les.grp]
                         else:  # в шапке «ВМК-11», в ячейке «ВМ-11» — сверяем по номеру группы
