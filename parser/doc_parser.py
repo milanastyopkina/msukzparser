@@ -56,8 +56,17 @@ WEEK_NO_RE = re.compile(r"(\d+)\s*неделя")
 
 # ---------------------------------------------------------------- helpers
 
+_LAT2CYR = str.maketrans("AaBCcEeHKMOoPpTXxy", "АаВСсЕеНКМОоРрТХху")
+_MIXED_WORD_RE = re.compile(r"(?=\w*[А-Яа-яЁё])(?=\w*[A-Za-z])\w+")
+
+
+def fix_lookalikes(s: str) -> str:
+    """«Cавицкий» с латинской C -> «Савицкий»: латинские двойники правим только в словах, где уже есть кириллица."""
+    return _MIXED_WORD_RE.sub(lambda m: m.group(0).translate(_LAT2CYR), s)
+
+
 def squash(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").replace("\xa0", " ")).strip()
+    return fix_lookalikes(re.sub(r"\s+", " ", (s or "").replace("\xa0", " ")).strip())
 
 
 def parse_codes(text: str) -> list[str]:
@@ -138,17 +147,37 @@ def clean_teacher(t: str) -> str:
     return squash(t)
 
 
+_MORE_TEACHER_RE = re.compile(
+    r"^\s*(?:,|;|/|и)\s*(?:" + TITLE_WORD + r"\s+)?(?:(?:КФ\s+)?МГУ\s+)?" + FIO)
+
+
 def _take_teacher(cur: Lesson, text: str) -> None:
     """text — всё, что после типа занятия: «доц. МГУ Фамилия И.О. (2) Э-11»."""
     text = squash(text)
     if not text:
         return
+    # кабинет мог оказаться после названия и типа: «Физика Лекция 614 профессор …»
+    rm = ROOM_RE.match(text)
+    if rm and not cur.room:
+        cur.room = squash(rm.group("room"))
+        text = text[rm.end():].strip()
+        if not text:
+            return
     m = FIO_RE.search(text)
     if not m:
         cur.teacher = clean_teacher(cur.teacher + " " + text)
         return
-    cur.teacher = clean_teacher(cur.teacher + " " + text[: m.end()])
-    tail = text[m.end():]
+    end = m.end()
+    parts = [text[: m.end()]]
+    while True:                               # второй и третий преподаватель: «Иванов И.И., доцент Петров П.П.»
+        mm = _MORE_TEACHER_RE.match(text[end:])
+        if not mm:
+            break
+        parts.append(text[end: end + mm.end()].lstrip(" ,;/и").strip())
+        end += mm.end()
+    cur.teacher = clean_teacher(", ".join(([cur.teacher] if cur.teacher else []) + parts)) \
+        if cur.teacher and FIO_RE.search(cur.teacher) else clean_teacher((cur.teacher + " " + parts[0]).strip() + "".join(", " + x for x in parts[1:]))
+    tail = text[end:]
     s = re.search(r"\((\d)\)", tail)
     if s:
         cur.sub = s.group(1)
@@ -176,7 +205,10 @@ def parse_cell(text: str) -> list[Lesson]:
                 target.grp = parse_codes(ln)[0]
             continue
         room_m = ROOM_RE.match(ln)
-        if not cur.empty() and (cur.teacher or (room_m and cur.subject)):
+        # «доцент КФ МГУ» на одной строке, а «Галиева Н.К.» перенесена на следующую — это тот же преподаватель
+        wrapped_fio = (not room_m and cur.teacher and not FIO_RE.search(cur.teacher)
+                       and FIO_RE.match(ln) is not None)
+        if not cur.empty() and not wrapped_fio and (cur.teacher or (room_m and cur.subject)):
             flush()
         rest = ln
         if room_m and not cur.room:
