@@ -87,23 +87,28 @@ function roomOf(l) {
   const r = l.room || (l.mode === "ДО" ? "онлайн" : "—");
   return l.zid ? `${r}${l.zcode ? ` (Zoom ${l.zid}, код ${l.zcode})` : ` (Zoom ${l.zid})`}` : r;
 }
-function lessonLine(l, withDate) {
+// Оформление расписания: разделители можно поменять одной строкой.
+const DIV_DAY = "────୨ৎ────";               // под заголовком дня
+const DIV_WEEK = "°❀⋆.ೃ࿔*:･°❀⋆";           // между днями в /week
+const PAIR_EMOJI = ["", "1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣"];
+function lessonLine(l) {
   const sub = l.sub ? ` [подгр. ${esc(l.sub)}]` : "";
-  const kind = l.kind ? ` · ${esc(l.kind)}` : "";
-  return `${hhmm(l.start_min)}–${hhmm(l.end_min)}  <b>${esc(l.subject)}</b>${kind}${sub}\n      🚪 ${esc(roomOf(l))}` +
-    (l.teacher ? `  👤 ${esc(l.teacher)}` : "") + (withDate ? "" : "");
+  const kind = l.kind ? ` · <i>${esc(l.kind)}</i>` : "";
+  const num = PAIR_EMOJI[l.pair] || "🕘";
+  return `${num} ${hhmm(l.start_min)}–${hhmm(l.end_min)}\n<b>${esc(l.subject)}</b>${kind}${sub}\n` +
+    `🚪 ${esc(roomOf(l))}` + (l.teacher ? ` · 👤 ${esc(l.teacher)}` : "");
 }
 function dayFromRows(group, date, rows, title) {
   const head = `${title ?? "📅"} <b>${fmtDate(date)}</b> · ${esc(group)}`;
   if (!rows.length) return `${head}\nЗанятий нет.`;
-  return `${head}\n\n` + rows.map((l) => lessonLine(l)).join("\n\n");
+  return `${head}\n${DIV_DAY}\n\n` + rows.map((l) => lessonLine(l)).join("\n\n");
 }
 function rangeFromRows(group, rows, title) {
   if (!rows.length) return `${title} · ${esc(group)}\nРасписание на эту неделю пока не найдено на Moodle. Как только оно появится, оно будет здесь.`;
   const by = {};
   for (const l of rows) (by[l.date] ||= []).push(l);
   return `${title} · ${esc(group)}\n\n` + Object.keys(by).map((d) =>
-    `<b>${fmtDate(d)}</b>\n` + by[d].map((l) => lessonLine(l)).join("\n")).join("\n\n");
+    `<b>${fmtDate(d)}</b>\n${DIV_DAY}\n\n` + by[d].map((l) => lessonLine(l)).join("\n\n")).join(`\n\n${DIV_WEEK}\n\n`);
 }
 const monOf = (s) => { const d = new Date(s + "T00:00:00Z"); return iso(addDays(d, -((d.getUTCDay() + 6) % 7))); };
 const NO_WEEK = "Расписание на эту неделю не найдено на Moodle, поэтому бот не знает, есть ли пары. " +
