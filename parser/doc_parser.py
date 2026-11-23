@@ -22,6 +22,15 @@ MONTHS = {
     "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
     "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
 }
+GRID = {1: ("09:00", "10:30"), 2: ("10:40", "12:10"), 3: ("12:30", "14:00"),
+        4: ("14:10", "15:40"), 5: ("15:50", "17:20"), 6: ("17:30", "19:00")}
+
+
+def _minutes(hhmm: str) -> int:
+    h, m = hhmm.split(":")
+    return int(h) * 60 + int(m)
+
+
 START_TO_PAIR = {"09:00": 1, "10:40": 2, "12:30": 3, "14:10": 4, "15:50": 5, "17:30": 6, "19:10": 7, "20:50": 8}
 ROMAN = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6, "VII": 7, "VIII": 8}
 
@@ -37,12 +46,13 @@ ROOM_RE = re.compile(
 )
 # Регистр важен: «Научно-исследовательский семинар» (в названии) не тип занятия.
 TYPE_RE = re.compile(
-    r"(?<!\S)(Лекци[яи]|Лек\.|Сем\.|Лаб\.|Практ\.|Семинар(?:ы)?|Лаборатор\w+(?:\s+работ\w+)?|Консультаци\w+|"
+    r"(?<!\S)(Лекци[яи]\.?|Лек\.|Сем\.|Семин\.|Лаб\.|Практ\.|Семинар(?:ы)?\.?|Лаборатор\w+(?:\s+работ\w+)?|Консультаци\w+|"
     r"Зач[её]т\w*|Экзамен\w*|Практическ\w+\s+занят\w+)(?!\S)"
 )
 TITLE_WORD = r"(?:ст\.\s?н\.\s?с\.|ст\.\s?преп\.?|ст\.преп|доцент|доц\.|профессор|проф\.|преп\.|ассистент|асс\.|сотр\.)"
 TEACHER_START_RE = re.compile(r"(?<!\S)" + TITLE_WORD + r"(?!\w)")
 TITLE_TAIL_RE = re.compile(r"\s+(ст\.\s?преп\.?|доцент|доц\.|профессор|проф\.|преп\.|ассистент|асс\.)$")
+SPEC_RE = re.compile(r"(?i)(?<!\w)спец\.?\s*группа")
 ZOOM_RE = re.compile(
     r"(?i)zoom(?:-(\d+))?[\s:|,]*(?:идентификатор:?\s*)?(\d[\d ]{7,12}\d)\s*,?\s*код\s*доступа:?\s*(\w+)"
 )
@@ -131,7 +141,7 @@ def norm_kind(k: str) -> str:
     low = k.lower()
     if low.startswith(("лекци", "лек.")):
         return "Лекция"
-    if low.startswith(("семинар", "сем.")):
+    if low.startswith(("семинар", "сем.", "семин.")):
         return "Семинар"
     if low.startswith("лаб"):
         return "Лабораторная"
@@ -238,7 +248,12 @@ def parse_cell(text: str) -> list[Lesson]:
         _take_teacher(cur, after)
     flush()
     # мусорные ячейки без единой буквы («0», «-», «.») парами не считаем
-    return [x for x in out if x.subject and re.search(r"[A-Za-zА-Яа-яЁё]", x.subject)]
+    res = [x for x in out if x.subject and re.search(r"[A-Za-zА-Яа-яЁё]", x.subject)]
+    for x in res:                                   # «Физкультура … Спец.группа ст.преп. Волков» -> предмет «… (спец. группа)»
+        if SPEC_RE.search(x.teacher) or SPEC_RE.search(x.subject):
+            x.teacher = squash(SPEC_RE.sub(" ", x.teacher))
+            x.subject = squash(SPEC_RE.sub(" ", x.subject)) + " (спец. группа)"
+    return res
 
 
 # ----------------------------------------------------------- the document
@@ -250,6 +265,7 @@ class ParsedDoc:
     week_no: int | None = None
     academic_year: int | None = None       # год начала учебного года
     direction: str = ""
+    week_parity: str = ""                  # «ч» числитель, «з» знаменатель, пусто — в файле не указано
     groups: dict[str, dict] = field(default_factory=dict)   # code -> {program, lessons: []}
     warnings: list[str] = field(default_factory=list)
 
@@ -297,6 +313,19 @@ def _pair_number(text: str) -> int | None:
     return ROMAN.get(t)
 
 
+def _pair_half(rows, i: int, col: int) -> int:
+    """Пара, разделённая на две строки (ячейки времени и номера объединены по вертикали): 1 — первая строка, 2 — вторая."""
+    try:
+        cur = rows[i].cells[col]._tc
+        prev_same = i > 0 and rows[i - 1].cells[col]._tc is cur
+        next_same = i + 1 < len(rows) and rows[i + 1].cells[col]._tc is cur
+    except Exception:
+        return 0
+    if prev_same:
+        return 2
+    return 1 if next_same else 0
+
+
 def parse_docx(path: str, fallback_codes: list[str] | None = None) -> ParsedDoc:
     doc = Document(path)
     text = doc_text(doc)
@@ -318,6 +347,13 @@ def parse_docx(path: str, fallback_codes: list[str] | None = None) -> ParsedDoc:
     m = re.search(r"направление\s*[«\"]([^»\"]+)[»\"]", text)
     if m:
         res.direction = squash(m.group(1)).capitalize()
+
+    # Числитель / знаменатель: в файле над таблицей стоит «ЧИСЛИТЕЛЬ ЗНАМЕНАТЕЛЬ» или «ЗНАМЕНАТЕЛЬ ЗНАМЕНАТЕЛЬ»;
+    # какая неделя идёт сейчас, определяет ПЕРВОЕ слово. Пара, разделённая в таблице на две строки, это верхняя (числитель)
+    # и нижняя (знаменатель) половины: на каждой неделе показываем только свою.
+    mp = re.search(r"(числител|знаменател)", text, re.I)
+    parity = ("ч" if mp.group(1).lower().startswith("числ") else "з") if mp else ""
+    res.week_parity = parity
 
     zooms = parse_zooms(text)
 
@@ -346,7 +382,7 @@ def parse_docx(path: str, fallback_codes: list[str] | None = None) -> ParsedDoc:
             inherited = True
 
         # 2. строки с занятиями
-        for row in rows:
+        for ri, row in enumerate(rows):
             cells = _unique_cells(row)
             time_i = pair_i = None
             for i, (txt, c0, c1) in enumerate(cells):
@@ -357,11 +393,17 @@ def parse_docx(path: str, fallback_codes: list[str] | None = None) -> ParsedDoc:
                     pair_i = i
             if time_i is None or pair_i is None:
                 continue
+            half = _pair_half(rows, ri, cells[time_i][1])    # 0 — обычная пара, 1 — верхняя (числитель), 2 — нижняя (знаменатель)
             tm = TIME_RE.fullmatch(squash(cells[time_i][0]))
             pair = _pair_number(cells[pair_i][0])
             start, end = hm(tm.group(1), tm.group(2)), hm(tm.group(3), tm.group(4))
             # номер пары по времени надёжнее, чем римская цифра (в файлах бывают опечатки вроде «IV» вместо «VI»)
             pair = START_TO_PAIR.get(start, pair)
+            # опечатка во времени («10:30» вместо «10:40»): если номер пары известен, берём время по сетке звонков
+            if start not in START_TO_PAIR and pair in GRID:
+                gs, ge = GRID[pair]
+                if abs(_minutes(start) - _minutes(gs)) <= 15:
+                    start, end = gs, ge
 
             # день недели
             found = None
@@ -406,6 +448,8 @@ def parse_docx(path: str, fallback_codes: list[str] | None = None) -> ParsedDoc:
                 if not codes_here:
                     res.warnings.append("не удалось определить группу для ячейки")
                     continue
+                if half and parity and ((half == 1) != (parity == "ч")):
+                    continue                      # половина пары для другой недели
                 for les in parse_cell(txt):
                     targets = codes_here
                     # спецсеминары («С/с …») выбирают по интересу, а не по группе: показываем всем группам потока,
