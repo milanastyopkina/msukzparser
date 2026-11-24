@@ -292,7 +292,8 @@ function htmlText(x) {
 }
 function parseJokes(html) {
   const out = [];
-  const re = /<div class="anekdot">\s*<p>([\s\S]*?)<\/p>\s*<\/div>/gi;
+  // Разметка на сайте старая (HTML 3.2): кавычки и закрывающие теги могут отсутствовать, регистр любой — берём текст до </div>.
+  const re = /<div[^>]*class\s*=\s*["']?anekdot(?=["'\s>])[^>]*>([\s\S]*?)<\/div>/gi;
   for (let m; (m = re.exec(html)); ) { const t = htmlText(m[1]); if (t) out.push(t); }
   return out;
 }
@@ -305,9 +306,9 @@ function pickJoke(list, seen = new Set()) {
 }
 // Сайт может не пускать запросы с серверов Cloudflare (403 и т.п.). Тогда анекдоты подкладывает GitHub Actions
 // (parser/jokes.py) в запас: строки jokes с day = 'p:…'. Запас берём только когда прямой запрос не удался.
-async function fetchJoke(seen) {
+async function fetchJoke(seen, url = JOKE_URL) {
   try {
-    const r = await fetch(JOKE_URL, { headers: {
+    const r = await fetch(url, { headers: {
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
       "Accept": "text/html,application/xhtml+xml", "Accept-Language": "ru-RU,ru;q=0.9" }, signal: AbortSignal.timeout(8000) });
     if (!r.ok) return { err: "HTTP " + r.status };
@@ -347,6 +348,35 @@ async function ensureJoke(env, today, m) {
   await env.DB.prepare("DELETE FROM jokes WHERE day LIKE 'p:%' AND text=?1").bind(text).run();
 }
 
+// Разовые «извинительные» анекдоты за пропущенные дни: берём из архива сайта (arc/ГГММДД.html), как только они доступны,
+// и один раз отправляем всем, кто согласился на анекдоты. После рассылки верните SORRY = null.
+const SORRY = { id: "sorry_nov24", days: ["2026-11-19", "2026-11-20"] };
+const RU_MONTH = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"];
+const ruDate = (d) => `${Number(d.slice(8))} ${RU_MONTH[Number(d.slice(5, 7)) - 1]}`;
+async function ensureSorry(env, m) {
+  const t = await env.DB.prepare("SELECT v FROM meta WHERE k='sorry_try'").first();
+  const [day, at] = (t?.v || "").split("|");
+  const out = [];
+  let tried = false;
+  for (const d of SORRY.days) {
+    let row = await env.DB.prepare("SELECT text FROM jokes WHERE day=?1").bind(d).first();
+    if (!row) {
+      if (day === "x" + d && m - Number(at) < 10) return null;
+      if (tried) return null;
+      tried = true;
+      await env.DB.prepare("INSERT OR REPLACE INTO meta (k,v) VALUES ('sorry_try', ?1)").bind(`x${d}|${m}`).run();
+      const { results: prev } = await env.DB.prepare("SELECT text FROM jokes WHERE day NOT LIKE 'p:%'").all();
+      const r = await fetchJoke(new Set(prev.map((x) => x.text)), `https://anekdotov.net/anekdot/arc/${d.slice(2, 4)}${d.slice(5, 7)}${d.slice(8)}.html`);
+      await env.DB.prepare("INSERT OR REPLACE INTO meta (k,v) VALUES ('sorry_err', ?1)").bind(`${d}: ${r.text ? "ок" : r.err}`).run();
+      if (!r.text) return null;
+      await env.DB.prepare("INSERT OR IGNORE INTO jokes (day, text) VALUES (?1, ?2)").bind(d, r.text).run();
+      row = { text: r.text };
+    }
+    out.push({ day: d, text: row.text });
+  }
+  return out;
+}
+
 async function handleMessage(env, msg) {
   const chat = msg.chat.id;
   const fl = flood(chat);
@@ -366,7 +396,7 @@ async function handleMessage(env, msg) {
     const last = (await env.DB.prepare("SELECT day FROM jokes WHERE day NOT LIKE 'p:%' ORDER BY day DESC LIMIT 1").first())?.day || "—";
     const yes = (await env.DB.prepare("SELECT COUNT(*) c FROM users WHERE jokes=1").first())?.c || 0;
     const ask = (await env.DB.prepare("SELECT COUNT(*) c FROM users WHERE jokes IS NULL AND COALESCE(fun_off,0)=0").first())?.c || 0;
-    return send(env, chat, `Анекдоты\nпоследний: ${last}\nисточник: ${await g("joke_src")}\nпопытка: ${await g("joke_try")}\nотправка: ${await g("jk_done")}\nпул: ${pool}\nсогласились: ${yes}, без ответа: ${ask}`);
+    return send(env, chat, `Анекдоты\nпоследний: ${last}\nисточник: ${await g("joke_src")}\nизвинения: ${await g("sorry_err")}\nпопытка: ${await g("joke_try")}\nотправка: ${await g("jk_done")}\nпул: ${pool}\nсогласились: ${yes}, без ответа: ${ask}`);
   }
   if (cmd === "/jokenow") {     // скрытая проверка: пробуем достать анекдот с сайта прямо сейчас (ничего не сохраняем)
     const r = await fetchJoke(new Set());
@@ -652,6 +682,18 @@ async function tick(env) {
         for (const u of us) { jobs.push({ chat_id: u.chat_id, key: "jk:" + today, text: jokeText(j.text) }); budget--; }
         if (!us.length) await env.DB.prepare("INSERT OR REPLACE INTO meta (k,v) VALUES ('jk_done', ?1)").bind(today).run();
       }
+    }
+  }
+  // 6б) разовые извинительные анекдоты за пропущенные дни (после ежедневного анекдота, днём и вечером)
+  if (SORRY && budget > 0 && m >= 9 * 60 && m < 22 * 60) {
+    const js = await ensureSorry(env, m);
+    if (js) {
+      const text = "😅 <b>Извините за пропущенные анекдоты!</b>\nУ нас были неполадки, зато вот два за те дни:\n\n" +
+        js.map((j) => `<b>${ruDate(j.day)}</b>\n${esc(j.text)}`).join("\n\n") + "\n\n<i>anekdotov.net</i>";
+      const { results: us } = await env.DB.prepare(
+        `SELECT u.chat_id FROM users u WHERE u.notify=1 AND u.jokes=1
+           AND NOT EXISTS (SELECT 1 FROM sent s WHERE s.chat_id=u.chat_id AND s.k=?1) LIMIT ?2`).bind("bc:" + SORRY.id, Math.min(budget, 20)).all();
+      for (const u of us) { jobs.push({ chat_id: u.chat_id, key: "bc:" + SORRY.id, text }); budget--; }
     }
   }
   // 7) один раз спросить всех, хотят ли они анекдоты (днём, после утренних рассылок; без ответа ничего не блокируется)
