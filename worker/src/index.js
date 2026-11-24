@@ -368,6 +368,10 @@ async function handleMessage(env, msg) {
     const ask = (await env.DB.prepare("SELECT COUNT(*) c FROM users WHERE jokes IS NULL AND COALESCE(fun_off,0)=0").first())?.c || 0;
     return send(env, chat, `Анекдоты\nпоследний: ${last}\nисточник: ${await g("joke_src")}\nпопытка: ${await g("joke_try")}\nотправка: ${await g("jk_done")}\nпул: ${pool}\nсогласились: ${yes}, без ответа: ${ask}`);
   }
+  if (cmd === "/jokenow") {     // скрытая проверка: пробуем достать анекдот с сайта прямо сейчас (ничего не сохраняем)
+    const r = await fetchJoke(new Set());
+    return send(env, chat, r.text ? "Сайт отвечает, анекдот найден:\n\n" + esc(r.text.slice(0, 200)) : "Не получилось: " + esc(r.err || "?"));
+  }
   if (cmd === "/support") return send(env, chat, "Возник вопрос или нашли ошибку в расписании? Напишите нам:", { reply_markup: supportKb });
   if (cmd === "/start" || cmd === "/group") return chooseGroup(env, chat);
   const u = await userGroup(env, chat);
