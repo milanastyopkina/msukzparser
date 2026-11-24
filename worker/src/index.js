@@ -350,7 +350,7 @@ async function ensureJoke(env, today, m) {
 
 // Разовые «извинительные» анекдоты за пропущенные дни: берём из архива сайта (arc/ГГММДД.html), как только они доступны,
 // и один раз отправляем всем, кто согласился на анекдоты. После рассылки верните SORRY = null.
-const SORRY = { id: "sorry_nov24", days: ["2026-11-19", "2026-11-20"] };
+const SORRY = null
 const RU_MONTH = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"];
 const ruDate = (d) => `${Number(d.slice(8))} ${RU_MONTH[Number(d.slice(5, 7)) - 1]}`;
 async function ensureSorry(env, m) {
