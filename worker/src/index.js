@@ -370,6 +370,13 @@ async function handleMessage(env, msg) {
   }
   if (cmd === "/jokenow") {     // скрытая проверка: пробуем достать анекдот с сайта прямо сейчас (ничего не сохраняем)
     const r = await fetchJoke(new Set());
+    if (r.err === "нет анекдотов в HTML") {   // покажем, что сайт отдал на самом деле
+      const x = await fetch(JOKE_URL, { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36", "Accept-Language": "ru-RU,ru;q=0.9" } });
+      const b = await x.arrayBuffer();
+      const h = new TextDecoder("windows-1251").decode(b);
+      const i = h.search(/anekdot/i);
+      return send(env, chat, `HTTP ${x.status}, ${b.byteLength} байт, ${esc(x.headers.get("content-type") || "")}\nНачало: ${esc(h.slice(0, 250).replace(/\s+/g, " "))}\nПервое «anekdot» на позиции ${i}: ${esc(i >= 0 ? h.slice(Math.max(0, i - 60), i + 200).replace(/\s+/g, " ") : "—")}`);
+    }
     return send(env, chat, r.text ? "Сайт отвечает, анекдот найден:\n\n" + esc(r.text.slice(0, 200)) : "Не получилось: " + esc(r.err || "?"));
   }
   if (cmd === "/support") return send(env, chat, "Возник вопрос или нашли ошибку в расписании? Напишите нам:", { reply_markup: supportKb });
