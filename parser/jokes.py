@@ -18,7 +18,7 @@ UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.3
       "Accept-Language": "ru-RU,ru;q=0.9"}
 # тот же фильтр, что в worker/src/index.js (JOKE_BAD)
 BAD = re.compile(r"х[уy][йеёяию]|пизд|бляд|бля[тд]ь|пидор|пидр|мудак|залуп|гандон|[её]б(?:ать|ан[аоуыи]?|ал[аио]?|аш|ну[лт]|ун)|проститутк|шлюх|сиськ|трахат|трахн|секс", re.I)
-ITEM = re.compile(r'<div class="anekdot">\s*<p>([\s\S]*?)</p>\s*</div>', re.I)
+ITEM = re.compile(r"""<div[^>]*class\s*=\s*["']?anekdot(?=["'\s>])[^>]*>([\s\S]*?)</div>""", re.I)
 
 
 def clean(x: str) -> str:
@@ -51,6 +51,12 @@ def main() -> int:
     page = r.content.decode(cs, errors="replace")
     items = parse(page)
     print("анекдотов:", len(items))
+    if not items:   # покажем, как выглядит разметка, чтобы подогнать разбор
+        i = page.lower().find("anekdot")
+        j = [m.start() for m in re.finditer(r"class\s*=\s*[\"']?anekdot", page, re.I)]
+        print("class=anekdot найдено:", len(j), "| начало:", page[:200].replace("\n", " "))
+        for k in j[:2]:
+            print("фрагмент:", page[max(0, k - 40):k + 300].replace("\n", " "))
     Path("out").mkdir(exist_ok=True)
     sql = "".join(f"INSERT OR IGNORE INTO jokes (day, text) VALUES ({q('p:' + hashlib.md5(t.encode()).hexdigest()[:12])}, {q(t)});\n" for t in items)
     Path("out/jokes.sql").write_text(sql, encoding="utf-8")
