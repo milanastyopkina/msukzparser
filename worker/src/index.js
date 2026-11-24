@@ -303,18 +303,24 @@ function pickJoke(list, seen = new Set()) {
   }
   return null;
 }
+// Сайт может не пускать запросы с серверов Cloudflare (403 и т.п.). Тогда анекдоты подкладывает GitHub Actions
+// (parser/jokes.py) в запас: строки jokes с day = 'p:…'. Запас берём только когда прямой запрос не удался.
 async function fetchJoke(seen) {
   try {
-    const r = await fetch(JOKE_URL, { headers: { "User-Agent": "Mozilla/5.0 (compatible; MudlikBot/1.0; +https://t.me/msu_kz_moodle_bot)" },
-      signal: AbortSignal.timeout(8000) });
-    if (!r.ok) return null;
+    const r = await fetch(JOKE_URL, { headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml", "Accept-Language": "ru-RU,ru;q=0.9" }, signal: AbortSignal.timeout(8000) });
+    if (!r.ok) return { err: "HTTP " + r.status };
     const buf = await r.arrayBuffer();
     const ct = r.headers.get("content-type") || "";
     const head = new TextDecoder("latin1").decode(buf.slice(0, 2048));
     const cs = (ct.match(/charset=([\w-]+)/i) || head.match(/charset=["']?([\w-]+)/i) || [])[1] || "utf-8";
     let html; try { html = new TextDecoder(cs).decode(buf); } catch { html = new TextDecoder("utf-8").decode(buf); }
-    return pickJoke(parseJokes(html), seen);
-  } catch { return null; }
+    const list = parseJokes(html);
+    if (!list.length) return { err: "нет анекдотов в HTML" };
+    const t = pickJoke(list, seen);
+    return t ? { text: t } : { err: "все уже были или не прошли фильтр" };
+  } catch (e) { return { err: String(e && e.message || e).slice(0, 60) }; }
 }
 // Берём анекдот на сегодня (один запрос к сайту в сутки; при неудаче повтор не чаще раза в 10 минут до 10:30).
 async function ensureJoke(env, today, m) {
@@ -325,9 +331,20 @@ async function ensureJoke(env, today, m) {
   const [day, at] = (t?.v || "").split("|");
   if (day === today && m - Number(at) < 10) return;
   await env.DB.prepare("INSERT OR REPLACE INTO meta (k,v) VALUES ('joke_try', ?1)").bind(`${today}|${m}`).run();
-  const { results: prev } = await env.DB.prepare("SELECT text FROM jokes ORDER BY day DESC LIMIT 60").all();
-  const j = await fetchJoke(new Set(prev.map((r) => r.text)));
-  if (j) await env.DB.prepare("INSERT OR IGNORE INTO jokes (day, text) VALUES (?1, ?2)").bind(today, j).run();
+  const { results: prev } = await env.DB.prepare("SELECT text FROM jokes WHERE day NOT LIKE 'p:%' ORDER BY day DESC LIMIT 60").all();
+  const seen = new Set(prev.map((r) => r.text));
+  let { text, err } = await fetchJoke(seen);
+  let from = "сайт";
+  if (!text) {   // запасной вариант: анекдот из пула, который пополняет GitHub Actions
+    const { results: pool } = await env.DB.prepare("SELECT text FROM jokes WHERE day LIKE 'p:%' ORDER BY day LIMIT 80").all();
+    text = pickJoke(pool.map((r) => r.text), seen);
+    from = "пул";
+  }
+  await env.DB.prepare("INSERT OR REPLACE INTO meta (k,v) VALUES ('joke_src', ?1)").bind(
+    `${today}|${text ? "ок (" + from + ")" : "нет"}${err ? "; сайт: " + err : ""}`).run();
+  if (!text) return;
+  await env.DB.prepare("INSERT OR IGNORE INTO jokes (day, text) VALUES (?1, ?2)").bind(today, text).run();
+  await env.DB.prepare("DELETE FROM jokes WHERE day LIKE 'p:%' AND text=?1").bind(text).run();
 }
 
 async function handleMessage(env, msg) {
@@ -340,8 +357,16 @@ async function handleMessage(env, msg) {
   if (cmd === "/info" || cmd === "/help") return send(env, chat, INFO_TEXT, { reply_markup: supportKb });
   if (cmd === "/stats") return send(env, chat, await statsText(env));
   if (cmd === "/joke" || cmd === "/anekdot") {
-    const j = await env.DB.prepare("SELECT text FROM jokes ORDER BY day DESC LIMIT 1").first();
+    const j = await env.DB.prepare("SELECT text FROM jokes WHERE day NOT LIKE 'p:%' ORDER BY day DESC LIMIT 1").first();
     return send(env, chat, j ? jokeText(j.text) : "Анекдотов пока нет. Загляните завтра после 9:00.");
+  }
+  if (cmd === "/jokedebug") {   // скрытая диагностика анекдотов
+    const g = async (k) => (await env.DB.prepare("SELECT v FROM meta WHERE k=?1").bind(k).first())?.v || "—";
+    const pool = (await env.DB.prepare("SELECT COUNT(*) c FROM jokes WHERE day LIKE 'p:%'").first())?.c || 0;
+    const last = (await env.DB.prepare("SELECT day FROM jokes WHERE day NOT LIKE 'p:%' ORDER BY day DESC LIMIT 1").first())?.day || "—";
+    const yes = (await env.DB.prepare("SELECT COUNT(*) c FROM users WHERE jokes=1").first())?.c || 0;
+    const ask = (await env.DB.prepare("SELECT COUNT(*) c FROM users WHERE jokes IS NULL AND COALESCE(fun_off,0)=0").first())?.c || 0;
+    return send(env, chat, `Анекдоты\nпоследний: ${last}\nисточник: ${await g("joke_src")}\nпопытка: ${await g("joke_try")}\nотправка: ${await g("jk_done")}\nпул: ${pool}\nсогласились: ${yes}, без ответа: ${ask}`);
   }
   if (cmd === "/support") return send(env, chat, "Возник вопрос или нашли ошибку в расписании? Напишите нам:", { reply_markup: supportKb });
   if (cmd === "/start" || cmd === "/group") return chooseGroup(env, chat);
