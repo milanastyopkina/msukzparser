@@ -16,8 +16,7 @@ import httpx
 URL = "https://anekdotov.net/anekdot/day/"
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
       "Accept-Language": "ru-RU,ru;q=0.9"}
-# тот же фильтр, что в worker/src/index.js (JOKE_BAD)
-BAD = re.compile(r"х[уy][йеёяию]|пизд|бляд|бля[тд]ь|пидор|пидр|мудак|залуп|гандон|[её]б(?:ать|ан[аоуыи]?|ал[аио]?|аш|ну[лт]|ун)|проститутк|шлюх|сиськ|трахат|трахн|секс", re.I)
+# тот же фильтр, что в worker/src/index.js (JOKE_BAD)BAD = re.compile(r"х[уy][йеёяию]|пизд|бляд|бля[тд]ь|пидор|пидр|залуп|гандон|[её]б(?:ать|ан[аоуыи]?|ал[аио]?|аш|ну[лт]|ун)|трахат|трахн|секс|путин|путл", re.I)
 ITEM = re.compile(r"""<div[^>]*class\s*=\s*["']?anekdot(?=["'\s>])[^>]*>([\s\S]*?)</div>""", re.I)
 
 
