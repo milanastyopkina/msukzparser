@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 INSERT OR IGNORE INTO meta(k,v) VALUES('ver','0');
 DROP VIEW IF EXISTS cur_lessons;
 CREATE VIEW cur_lessons AS SELECT * FROM lessons WHERE ver = (SELECT CAST(v AS INTEGER) FROM meta WHERE k='ver');
-CREATE TABLE IF NOT EXISTS users (chat_id INTEGER PRIMARY KEY, group_code TEXT, notify INTEGER DEFAULT 1, map_pre INTEGER DEFAULT 0, jokes INTEGER, fun_off INTEGER);
+CREATE TABLE IF NOT EXISTS users (chat_id INTEGER PRIMARY KEY, group_code TEXT, notify INTEGER DEFAULT 1, map_pre INTEGER DEFAULT 0, jokes INTEGER, fun_off INTEGER, week_off INTEGER, day_off INTEGER, pre_off INTEGER);
 -- для уже созданной базы один раз выполнить: ALTER TABLE users ADD COLUMN map_pre INTEGER DEFAULT 0;
 CREATE TABLE IF NOT EXISTS sent (chat_id INTEGER, k TEXT, PRIMARY KEY(chat_id, k));
 CREATE TABLE IF NOT EXISTS news (id INTEGER PRIMARY KEY, feed TEXT, feeds TEXT, title TEXT, url TEXT, seen INTEGER);
