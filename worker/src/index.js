@@ -206,12 +206,19 @@ async function statsText(env) {
 }
 const SUBS_TEXT = "Выберите, о чём присылать короткие уведомления (заголовок + ссылка на сайт msu.kz). Нажатие включает/выключает раздел:";
 
-const NOTIFY_TEXT = "Настройки уведомлений. Нажатие включает или выключает пункт:";
+const NOTIFY_TEXT = "Настройки уведомлений. Нажатие включает или выключает пункт.\n\nНапример, чтобы получать только расписание на неделю, оставьте включённым первый пункт и выключите расписание дня и напоминания перед парами.";
+// Отдельные виды напоминаний: колонки *_off (пусто или 0 — включено, 1 — выключено), чтобы у всех старых пользователей
+// всё оставалось включённым без переноса данных.
+const NOTIFY_COLS = { "n:w": "week_off", "n:d": "day_off", "n:p": "pre_off" };
 async function notifyKeyboard(env, chat) {
-  const u = await env.DB.prepare("SELECT notify, map_pre, jokes FROM users WHERE chat_id=?1").bind(chat).first();
+  const u = await env.DB.prepare("SELECT notify, map_pre, jokes, week_off, day_off, pre_off FROM users WHERE chat_id=?1").bind(chat).first();
+  const on = (v) => (v ? "⬜ " : "✅ ");
   return { inline_keyboard: [
     [{ text: (u?.notify ? "🔔 Уведомления: вкл" : "🔕 Уведомления: выкл"), callback_data: "n:t" }],
-    [{ text: (u?.map_pre ? "✅ " : "⬜ ") + `Карта кабинета за ${MAP_LEAD} мин до пары`, callback_data: "n:m" }],
+    [{ text: on(u?.week_off) + "Расписание недели (вс вечером)", callback_data: "n:w" }],
+    [{ text: on(u?.day_off) + "Расписание дня (за час до первой пары)", callback_data: "n:d" }],
+    [{ text: on(u?.pre_off) + "Напоминание перед каждой парой", callback_data: "n:p" }],
+    [{ text: (u?.map_pre ? "✅ " : "⬜ ") + `Карта кабинета за ${MAP_LEAD} мин до пары` + (u?.pre_off ? " (с напоминанием)" : ""), callback_data: "n:m" }],
     [{ text: (u?.jokes === 1 ? "✅ " : "⬜ ") + `Анекдот дня в ${JOKE_HOUR}:00`, callback_data: "n:j" }] ] };
 }
 
@@ -244,7 +251,7 @@ const INFO_TEXT = `<b>Что умеет Мудлик</b>
 • в воскресенье в ${UPDATE_HOUR}:00 — расписание на всю следующую неделю с кабинетами
 • за час до первой пары — расписание на день
 • за 15 минут до каждой пары — какая пара и в каком кабинете
-Настройки: /notify. Там же можно включить карту кабинета: за 20 минут до пары бот пришлёт карту этажа с отмеченным кабинетом.
+В /notify каждый вид уведомлений включается и выключается отдельно: например, можно оставить только расписание на неделю. Там же можно включить карту кабинета: за 20 минут до пары бот пришлёт карту этажа с отмеченным кабинетом.
 Выключить и включить все уведомления: /notify off и /notify on
 
 <b>Новости и объявления</b>
@@ -663,6 +670,12 @@ async function handleCallback(env, cb) {
         : never ? "Хорошо, развлекательные уведомления присылать и предлагать не будем. Расписание и напоминания продолжат приходить как обычно. Передумаете — включите анекдоты в /notify."
         : "Хорошо, анекдоты присылать не будем. Передумаете — включите в /notify." });
   }
+  if (NOTIFY_COLS[cb.data]) {
+    await tg(env, "answerCallbackQuery", { callback_query_id: cb.id });
+    const col = NOTIFY_COLS[cb.data];
+    await env.DB.prepare(`UPDATE users SET ${col} = 1 - COALESCE(${col},0) WHERE chat_id=?1`).bind(chat).run();
+    return tg(env, "editMessageReplyMarkup", { chat_id: chat, message_id: cb.message.message_id, reply_markup: await notifyKeyboard(env, chat) });
+  }
   if (cb.data === "n:t" || cb.data === "n:m" || cb.data === "n:j") {
     await tg(env, "answerCallbackQuery", { callback_query_id: cb.id });
     const col = cb.data === "n:t" ? "notify" : cb.data === "n:m" ? "map_pre" : "jokes";
@@ -678,7 +691,7 @@ async function handleCallback(env, cb) {
     await env.DB.prepare(
       "INSERT INTO users(chat_id, group_code, notify) VALUES(?1,?2,1) ON CONFLICT(chat_id) DO UPDATE SET group_code=?2").bind(chat, code).run();
     if (!existed) for (const f of DEFAULT_FEEDS) await env.DB.prepare("INSERT OR IGNORE INTO subs(chat_id,feed,since) VALUES(?1,?2,?3)").bind(chat, f, nowSec(env)).run();
-    return send(env, chat, `✅ Группа <b>${esc(code)}</b> сохранена.\nУведомления включены: воскресенье — расписание недели, за час до первой пары, за 15 минут до каждой.\n\nНовости и объявления: /news\n/today /week /next /notify /support`, { reply_markup: supportKb });
+    return send(env, chat, `✅ Группа <b>${esc(code)}</b> сохранена.\nУведомления включены: воскресенье — расписание недели, за час до первой пары, за 15 минут до каждой. Что из этого присылать, можно выбрать в /notify.\n\nНовости и объявления: /news\n/today /week /next /notify /support`, { reply_markup: supportKb });
   }
 }
 
@@ -740,7 +753,7 @@ async function tick(env) {
   if (g1) {
     const { results } = await env.DB.prepare(
       `SELECT u.chat_id, u.map_pre, l.* FROM users u JOIN cur_lessons l ON l.group_code=u.group_code
-       WHERE u.notify=1 AND l.date=?1 AND l.start_min-?2 BETWEEN 5 AND CASE WHEN u.map_pre=1 THEN 27 ELSE 22 END
+       WHERE u.notify=1 AND COALESCE(u.pre_off,0)=0 AND l.date=?1 AND l.start_min-?2 BETWEEN 5 AND CASE WHEN u.map_pre=1 THEN 27 ELSE 22 END
          AND NOT EXISTS (SELECT 1 FROM sent s WHERE s.chat_id=u.chat_id AND s.k='pre:'||l.date||':'||l.start_min)
        ORDER BY l.start_min, u.chat_id, l.sub`).bind(today, m).all();
     const cands = [...groupBy(results, (r) => r.chat_id + "|" + r.start_min).values()].map((rows) => {
@@ -760,7 +773,7 @@ async function tick(env) {
     const { results: us } = await env.DB.prepare(
       `SELECT u.chat_id, u.group_code, x.f FROM users u
        JOIN (SELECT group_code, MIN(start_min) f FROM cur_lessons WHERE date=?1 GROUP BY group_code) x ON x.group_code=u.group_code
-       WHERE u.notify=1 AND x.f-?2 BETWEEN 30 AND 75
+       WHERE u.notify=1 AND COALESCE(u.day_off,0)=0 AND x.f-?2 BETWEEN 30 AND 75
          AND NOT EXISTS (SELECT 1 FROM sent s WHERE s.chat_id=u.chat_id AND s.k='day:'||?1)`).bind(today, m).all();
     const cands = us.map((u) => ({ ...u, key: "day:" + today, lead: u.f - m - 60 })); // lead<=0 <=> до первой пары ≤60 мин
     const chosen = pick(cands, 0, budget);
@@ -808,7 +821,7 @@ async function tick(env) {
   }
   if (sunOk) {
     const { results: us } = await env.DB.prepare(
-      `SELECT u.chat_id, u.group_code FROM users u WHERE u.notify=1 AND u.group_code IS NOT NULL
+      `SELECT u.chat_id, u.group_code FROM users u WHERE u.notify=1 AND COALESCE(u.week_off,0)=0 AND u.group_code IS NOT NULL
          AND NOT EXISTS (SELECT 1 FROM sent s WHERE s.chat_id=u.chat_id AND s.k='sun:'||?1) LIMIT ?2`).bind(today, budget).all();
     if (us.length) {
       const mon = iso(addDays(d, 1)), sat = iso(addDays(d, 6));
