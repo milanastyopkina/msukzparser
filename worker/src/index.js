@@ -148,6 +148,20 @@ async function freshness(env) {
   const when = c.getUTCHours() >= UPDATE_HOUR - 1 ? `актуально на ${UPDATE_HOUR}:00, ${dayMonth(iso(c))}` : `обновлено ${dayMonth(iso(c))}`;
   return `\n\n🕒 <i>Расписание ${when}. Следующее обновление: ${dayMonth(nextDay)} в ${UPDATE_HOUR}:00.</i>`;
 }
+// ---------------------------------------------------------------- Неверное расписание в Moodle
+// Парсер (parser/sync.py) кладёт в meta 'wrong' группы, для которых на Moodle лежит файл с чужим расписанием:
+// {"ВМК-21": {"week": "2026-11-23", "title": "…"}}. Студентам этих групп один раз за неделю приходит предупреждение,
+// и оно же добавляется к ответам /today, /week и т.п.
+async function wrongGroups(env) {
+  const r = await env.DB.prepare("SELECT v FROM meta WHERE k='wrong'").first();
+  let w; try { w = r?.v ? JSON.parse(r.v) : {}; } catch { return {}; }
+  const cutoff = iso(addDays(nowLocal(env), -6));                  // неделя (пн) закончилась в субботу
+  for (const k of Object.keys(w)) if (!w[k]?.week || w[k].week < cutoff) delete w[k];
+  return w;
+}
+const wrongText = (code) => `⚠️ <b>${esc(code)}</b>: у вас загружено неверное расписание в Moodle (в файле расписание другой группы). ` +
+  `Прошу обратиться с правильным файлом расписания к @aitufmstaff.`;
+
 async function reply(env, chat, text) { return send(env, chat, text + (await freshness(env))); }
 
 async function groupKeyboard(env, course) {
@@ -224,6 +238,7 @@ const INFO_TEXT = `<b>Что умеет Мудлик</b>
 /next — ближайшая пара
 /group — сменить группу
 /room 507 — карта кабинета (5–7 этажи)
+/freerooms — какие кабинеты сейчас свободны и до скольких; можно выбрать другой день и время (/freerooms 26.11 14:10). Список считается по расписанию, поэтому кабинет всё же может быть занят.
 
 <b>Уведомления</b> (включены по умолчанию)
 • в воскресенье в ${UPDATE_HOUR}:00 — расписание на всю следующую неделю с кабинетами
@@ -251,17 +266,7 @@ const INFO_TEXT = `<b>Что умеет Мудлик</b>
 
 // Разовая рассылка всем пользователям (по одному разу на id). Чтобы разослать новое — задайте
 // const BROADCAST = { id: "upd2", text: `...` }; (новый id), задеплойте, а после рассылки верните null.
-const BROADCAST = { id: "upd_nov23", text: `✨ <b>Мини-обновление Мудлика</b>
-
-📅 <b>Числитель / знаменатель.</b> Бот теперь понимает чередование недель: если пара есть только на числителе или только на знаменателе, нужная будет ровно в свою неделю.
-
-😄 <b>Анекдот дня.</b> Раз в день в 9:00 будет приходить свежий анекдот. Включить или выключить его можно в /notify, а посмотреть последний анекдот в любой момент — командой /joke.
-
-🛠 <b>Исправления.</b> Починили потерянные фамилии преподавателей, спецсеминары, ошибки в аудиториях и времени, а ещё сделали расписание аккуратнее.
-
-💛 Спасибо, что пользуетесь ботом и пишете, когда что-то не так: благодаря вам он становится лучше для всех.
-
-Расскажите о боте друзьям и одногруппникам и помогите своему факультету подняться в еженедельном рейтинге ;)` };
+const BROADCAST = null;
 
 // ---------------------------------------------------------------- Анекдот дня
 // Раз в сутки в 9:00 присылаем один анекдот из «Лучших анекдотов дня» (там лучшее за вчера). Только тем, кто согласился (users.jokes=1).
@@ -275,7 +280,7 @@ const JOKE_KB = { inline_keyboard: [
   [{ text: "🚫 Не хочу получать такого рода уведомления", callback_data: "j:x" }],
   [{ text: "❌ Нет, спасибо", callback_data: "j:0" }] ] };
 // Простой фильтр: мат и совсем откровенные темы пропускаем (берём следующий анекдот). Список можно дополнять.
-const JOKE_BAD = /х[уy][йеёяию]|пизд|бляд|бля[тд]ь|пидор|пидр|залуп|гандон|[её]б(?:ать|ан[аоуыи]?|ал[аио]?|аш|ну[лт]|ун)|трахат|трахн|секс|путин|путл/i;
+const JOKE_BAD = /х[уy][йеёяию]|пизд|бляд|бля[тд]ь|пидор|пидр|мудак|залуп|гандон|[её]б(?:ать|ан[аоуыи]?|ал[аио]?|аш|ну[лт]|ун)|проститутк|шлюх|сиськ|трахат|трахн|секс|путин|путл/i;
 
 function jokeText(text) { return `😄 <b>Анекдот дня</b>\n\n${esc(text)}\n\n<i>anekdotov.net</i>`; }
 
@@ -337,7 +342,7 @@ async function ensureJoke(env, today, m) {
   let { text, err } = await fetchJoke(seen);
   let from = "сайт";
   if (!text) {   // запасной вариант: анекдот из пула, который пополняет GitHub Actions
-    const { results: pool } = await env.DB.prepare("SELECT text FROM jokes WHERE day LIKE 'p:%' ORDER BY day LIMIT 80").all();
+    const { results: pool } = await env.DB.prepare("SELECT text FROM jokes WHERE day LIKE 'p:%' ORDER BY day DESC LIMIT 80").all();
     text = pickJoke(pool.map((r) => r.text), seen);
     from = "пул";
   }
@@ -350,7 +355,7 @@ async function ensureJoke(env, today, m) {
 
 // Разовые «извинительные» анекдоты за пропущенные дни: берём из архива сайта (arc/ГГММДД.html), как только они доступны,
 // и один раз отправляем всем, кто согласился на анекдоты. После рассылки верните SORRY = null.
-const SORRY = null
+const SORRY = null;   // пример: { id: "sorry_nov24", days: ["2026-11-19", "2026-11-20"] }
 const RU_MONTH = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"];
 const ruDate = (d) => `${Number(d.slice(8))} ${RU_MONTH[Number(d.slice(5, 7)) - 1]}`;
 async function ensureSorry(env, m) {
@@ -377,6 +382,168 @@ async function ensureSorry(env, m) {
   return out;
 }
 
+// ---------------------------------------------------------------- Свободные кабинеты
+// Считаем по расписанию всех групп из базы: кабинет занят, если в нём стоит пара (Zoom и ДО не считаются).
+// Перерывы между парами короче FREE_MIN минут (обычные 10 минут и большой перерыв 20 минут) не считаем свободным временем.
+const FREE_MIN = 30, FREE_PAGE = 15, DAY_END = 19 * 60;
+const PAIR_START = [[1, 9 * 60], [2, 10 * 60 + 40], [3, 12 * 60 + 30], [4, 14 * 60 + 10], [5, 15 * 60 + 50], [6, 17 * 60 + 30]];
+const PAIR_ROMAN = ["", "I", "II", "III", "IV", "V", "VI"];
+const FREE_NOTE = "<i>Список основан на данных из расписания. Кабинеты могут быть заняты, но можете перепроверить.</i>";
+// Показываем только учебные аудитории из rooms.json (5–7 этажи), кроме кафедр и администрации.
+// Чужие аудитории (например, арендуемые 111 и 112) в список не попадают: они есть только в расписании групп.
+const NOT_FREE = new Set(["703", "704", "705", "717", "719", "720", "721", "722", "723", "724", "725", "726", "727", "729"]);
+const ROOM_LIST = Object.keys(ROOMS).filter((no) => !NOT_FREE.has(no)).sort();
+const ROOM_SET = new Set(ROOM_LIST);
+const dcode = (s) => s.replace(/-/g, "");                                  // 2026-11-25 -> 20261125 (для callback_data)
+const dfrom = (c) => `${c.slice(0, 4)}-${c.slice(4, 6)}-${c.slice(6, 8)}`;
+
+// Дни, на которые можно смотреть: от сегодня до субботы этой недели + следующая неделя, если её расписание уже загружено
+async function freeDays(env) {
+  const d = nowLocal(env), dow = (d.getUTCDay() + 6) % 7;                  // 0 = пн … 6 = вс
+  const out = [];
+  for (let i = dow; i <= 5; i++) out.push(iso(addDays(d, i - dow)));
+  const nmon = addDays(d, 7 - dow);
+  const has = await env.DB.prepare("SELECT 1 FROM cur_lessons WHERE date BETWEEN ?1 AND ?2 LIMIT 1").bind(iso(nmon), iso(addDays(nmon, 5))).first();
+  if (has) for (let i = 0; i <= 5; i++) out.push(iso(addDays(nmon, i)));
+  return out;
+}
+
+async function freeRooms(env, date, at) {
+  const { results } = await env.DB.prepare(
+    "SELECT room, start_min, end_min, mode, zid FROM cur_lessons WHERE date=?1 AND room IS NOT NULL").bind(date).all();
+  const busy = {};
+  let end = DAY_END;
+  for (const l of results) {
+    const no = roomNo(l);
+    if (!no || !ROOM_SET.has(no)) continue;
+    (busy[no] ||= []).push([l.start_min, l.end_min]);
+    end = Math.max(end, l.end_min);
+  }
+  const free = [], soon = [];
+  for (const no of ROOM_LIST) {
+    // склеиваем пары, между которыми меньше FREE_MIN минут
+    const iv = (busy[no] || []).sort((a, b) => a[0] - b[0]).reduce((acc, [a, b]) => {
+      const last = acc[acc.length - 1];
+      if (last && a - last[1] < FREE_MIN) last[1] = Math.max(last[1], b); else acc.push([a, b]);
+      return acc;
+    }, []);
+    const cur = iv.find(([a, b]) => a <= at && at < b);
+    if (!cur) {
+      const next = iv.find(([a]) => a > at);
+      free.push({ no, until: next ? next[0] : null });
+    } else if (cur[1] < end) {
+      const next = iv.find(([a]) => a > cur[1]);
+      soon.push({ no, from: cur[1], until: next ? next[0] : null });
+    }
+  }
+  soon.sort((a, b) => a.from - b.from || a.no.localeCompare(b.no));
+  return { free, soon, lessons: results.length, end };
+}
+
+async function freeView(env, date, at, page, live) {
+  const r = await freeRooms(env, date, at);
+  const when = live ? `сейчас ${hhmm(at)}` : `на ${hhmm(at)}`;
+  const head = `🚪 <b>Свободные кабинеты</b> · ${fmtDate(date)}, ${when}\n${FREE_NOTE}`;
+  const pick = [{ text: "📅 Выбрать день и время", callback_data: "fd" }];
+  const sunday = fmtDate(date).startsWith("Вс");
+  if (sunday || !r.lessons) {
+    const why = sunday ? "В воскресенье занятий нет — все кабинеты свободны."
+      : "По расписанию в этот день занятий нет (или расписание на этот день ещё не загружено).";
+    return { text: `${head}\n\n${why}`, kb: { inline_keyboard: [pick] } };
+  }
+  if (at >= r.end) return { text: `${head}\n\nВ это время занятий по расписанию уже нет — все кабинеты свободны.`, kb: { inline_keyboard: [pick] } };
+  const till = (u) => (u == null ? "до конца дня" : `до ${hhmm(u)}`);
+  const items = [
+    ...r.free.map((x) => ({ s: 0, t: `<b>${x.no}</b> — ${till(x.until)}` })),
+    ...r.soon.map((x) => ({ s: 1, t: `<b>${x.no}</b> — с ${hhmm(x.from)} ${till(x.until)}` })),
+  ];
+  const pages = Math.max(1, Math.ceil(items.length / FREE_PAGE));
+  page = Math.min(Math.max(0, page), pages - 1);
+  const slice = items.slice(page * FREE_PAGE, (page + 1) * FREE_PAGE);
+  const titles = [`🟢 <b>Свободны ${live ? "сейчас" : "в " + hhmm(at)}</b> (${r.free.length})`, `⏳ <b>Освободятся позже</b> (${r.soon.length})`];
+  let body = "";
+  for (const sec of [0, 1]) {
+    const part = slice.filter((x) => x.s === sec);
+    if (part.length) body += `\n\n${titles[sec]}\n` + part.map((x) => x.t).join("\n");
+  }
+  if (!items.length) body = "\n\nПо расписанию все кабинеты заняты до конца дня.";
+  const cb = (p) => `fr:${dcode(date)}:${at}:${p}:${live ? "n" : "t"}`;
+  const nav = [];
+  if (pages > 1) {
+    nav.push(page > 0 ? { text: "◀️ Назад", callback_data: cb(page - 1) } : { text: "·", callback_data: "fr:-" });
+    nav.push({ text: `${page + 1} / ${pages}`, callback_data: "fr:-" });
+    nav.push(page < pages - 1 ? { text: "Вперёд ▶️", callback_data: cb(page + 1) } : { text: "·", callback_data: "fr:-" });
+  }
+  const rows = [];
+  if (nav.length) rows.push(nav);
+  rows.push(live ? [{ text: "🔄 Обновить", callback_data: "fr:now" }, ...pick] : [{ text: "🕒 Сейчас", callback_data: "fr:now" }, ...pick]);
+  return { text: head + body + "\n\nКарта кабинета (5–7 этажи): /room 507", kb: { inline_keyboard: rows } };
+}
+async function freeNow(env, page = 0) {
+  const d = nowLocal(env);
+  return freeView(env, iso(d), d.getUTCHours() * 60 + d.getUTCMinutes(), page, true);
+}
+async function freeDaysKb(env) {
+  const days = await freeDays(env), today = iso(nowLocal(env));
+  const rows = []; let row = [];
+  for (const x of days) {
+    row.push({ text: (x === today ? "Сегодня, " : "") + fmtDate(x), callback_data: "fd:" + dcode(x) });
+    if (row.length === 3) { rows.push(row); row = []; }
+  }
+  if (row.length) rows.push(row);
+  rows.push([{ text: "🕒 Свободны сейчас", callback_data: "fr:now" }]);
+  return { text: "📅 <b>Свободные кабинеты</b>\nВыберите день:" + (days.length ? "" : "\n\nНа этой неделе учебных дней больше нет, а расписание следующей ещё не загружено."), kb: { inline_keyboard: rows } };
+}
+function freeTimeKb(env, date) {
+  const d = nowLocal(env), today = iso(d), m = d.getUTCHours() * 60 + d.getUTCMinutes();
+  const rows = []; let row = [];
+  if (date === today) rows.push([{ text: "🕒 Сейчас", callback_data: "fr:now" }]);
+  for (const [p, st] of PAIR_START) {
+    if (date === today && st + 90 <= m) continue;                       // пара уже закончилась
+    row.push({ text: `${PAIR_ROMAN[p]} пара · ${hhmm(st)}`, callback_data: `fr:${dcode(date)}:${st}:0:t` });
+    if (row.length === 2) { rows.push(row); row = []; }
+  }
+  if (row.length) rows.push(row);
+  rows.push([{ text: "◀️ Другой день", callback_data: "fd" }]);
+  return { text: `📅 <b>Свободные кабинеты</b> · ${fmtDate(date)}\nВыберите время (начало пары) или напишите, например: /freerooms ${date.slice(8)}.${date.slice(5, 7)} 13:00`, kb: { inline_keyboard: rows } };
+}
+// /freerooms, /freerooms 14:10, /freerooms 26.11 14:10
+async function freeCommand(env, chat, text) {
+  const arg = text.split(/\s+/).slice(1).join(" ");
+  if (!arg) { const v = await freeNow(env); return send(env, chat, v.text, { reply_markup: v.kb }); }
+  const tm = /(\d{1,2}):(\d{2})\s*$/.exec(arg);
+  const dm = /(\d{1,2})\.(\d{1,2})(?:\.\d{2,4})?(?=\s|$)/.exec(tm ? arg.slice(0, tm.index) : arg);
+  if (!tm && !dm) return send(env, chat, "Не понял. Примеры: /freerooms, /freerooms 14:10, /freerooms 26.11 14:10");
+  const days = await freeDays(env);
+  let date = iso(nowLocal(env));
+  if (dm) {
+    const want = `-${dm[2].padStart(2, "0")}-${dm[1].padStart(2, "0")}`;
+    date = days.find((x) => x.endsWith(want));
+    if (!date) return send(env, chat, "Можно выбрать только день текущей недели (или следующей, если её расписание уже загружено).", { reply_markup: (await freeDaysKb(env)).kb });
+  }
+  if (!tm) { const v = freeTimeKb(env, date); return send(env, chat, v.text, { reply_markup: v.kb }); }
+  const at = Number(tm[1]) * 60 + Number(tm[2]);
+  if (at >= 24 * 60 || Number(tm[2]) > 59) return send(env, chat, "Не понял время. Пример: /freerooms 14:10 или /freerooms 26.11 14:10");
+  if (!dm && /\d/.test(arg.slice(0, tm.index))) return send(env, chat, "Не понял дату. Пример: /freerooms 26.11 14:10");
+  const v = await freeView(env, date, at, 0, false);
+  return send(env, chat, v.text, { reply_markup: v.kb });
+}
+async function freeCallback(env, cb, chat) {
+  const edit = (v) => tg(env, "editMessageText", { chat_id: chat, message_id: cb.message.message_id, parse_mode: "HTML", text: v.text, reply_markup: v.kb });
+  const data = cb.data;
+  if (data === "fr:-") return tg(env, "answerCallbackQuery", { callback_query_id: cb.id });
+  await tg(env, "answerCallbackQuery", { callback_query_id: cb.id });
+  if (data === "fr:now") return edit(await freeNow(env));
+  if (data === "fd") return edit(await freeDaysKb(env));
+  let mm = /^fd:(\d{8})$/.exec(data);
+  if (mm) return edit(freeTimeKb(env, dfrom(mm[1])));
+  mm = /^fr:(\d{8}):(\d{1,4}):(\d{1,2}):([nt])$/.exec(data);
+  if (!mm) return;
+  const date = dfrom(mm[1]), at = Number(mm[2]), page = Number(mm[3]);
+  if (at >= 24 * 60) return;
+  return edit(await freeView(env, date, at, page, mm[4] === "n"));
+}
+
 async function handleMessage(env, msg) {
   const chat = msg.chat.id;
   const fl = flood(chat);
@@ -400,15 +567,9 @@ async function handleMessage(env, msg) {
   }
   if (cmd === "/jokenow") {     // скрытая проверка: пробуем достать анекдот с сайта прямо сейчас (ничего не сохраняем)
     const r = await fetchJoke(new Set());
-    if (r.err === "нет анекдотов в HTML") {   // покажем, что сайт отдал на самом деле
-      const x = await fetch(JOKE_URL, { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36", "Accept-Language": "ru-RU,ru;q=0.9" } });
-      const b = await x.arrayBuffer();
-      const h = new TextDecoder("windows-1251").decode(b);
-      const i = h.search(/anekdot/i);
-      return send(env, chat, `HTTP ${x.status}, ${b.byteLength} байт, ${esc(x.headers.get("content-type") || "")}\nНачало: ${esc(h.slice(0, 250).replace(/\s+/g, " "))}\nПервое «anekdot» на позиции ${i}: ${esc(i >= 0 ? h.slice(Math.max(0, i - 60), i + 200).replace(/\s+/g, " ") : "—")}`);
-    }
     return send(env, chat, r.text ? "Сайт отвечает, анекдот найден:\n\n" + esc(r.text.slice(0, 200)) : "Не получилось: " + esc(r.err || "?"));
   }
+  if (cmd === "/freerooms" || cmd === "/free") return freeCommand(env, chat, text);
   if (cmd === "/support") return send(env, chat, "Возник вопрос или нашли ошибку в расписании? Напишите нам:", { reply_markup: supportKb });
   if (cmd === "/start" || cmd === "/group") return chooseGroup(env, chat);
   const u = await userGroup(env, chat);
@@ -416,6 +577,7 @@ async function handleMessage(env, msg) {
   const today = iso(nowLocal(env));
   const g = u.group_code;
   if (["/today", "/tomorrow", "/week", "/nextweek", "/next"].includes(cmd)) {
+    if ((await wrongGroups(env))[g]) await send(env, chat, wrongText(g), { reply_markup: supportKb });
     const has = await env.DB.prepare("SELECT 1 FROM cur_lessons WHERE group_code=?1 LIMIT 1").bind(g).first();
     if (!has) return reply(env, chat, `Для группы <b>${esc(g)}</b> расписание пока не опубликовано на Moodle. Как только оно появится, оно будет здесь автоматически.`);
   }
@@ -460,7 +622,7 @@ async function handleMessage(env, msg) {
     return send(env, chat, NOTIFY_TEXT, { reply_markup: await notifyKeyboard(env, chat) });
   }
   return send(env, chat,
-    `Ваша группа: <b>${esc(g)}</b>\n\n/today — сегодня\n/tomorrow — завтра\n/week — неделя\n/nextweek — следующая неделя\n/next — ближайшая пара\n/group — сменить группу\n/news — подписка на новости и объявления\n/notify — настройки уведомлений\n/room 507 — карта кабинета\n/joke — анекдот дня\n/support — написать в поддержку`, { reply_markup: supportKb });
+    `Ваша группа: <b>${esc(g)}</b>\n\n/today — сегодня\n/tomorrow — завтра\n/week — неделя\n/nextweek — следующая неделя\n/next — ближайшая пара\n/group — сменить группу\n/news — подписка на новости и объявления\n/notify — настройки уведомлений\n/room 507 — карта кабинета\n/freerooms — свободные кабинеты\n/joke — анекдот дня\n/support — написать в поддержку`, { reply_markup: supportKb });
 }
 
 async function handleCallback(env, cb) {
@@ -468,6 +630,7 @@ async function handleCallback(env, cb) {
   const chat = cb.message.chat.id;
   if (cb.from?.id !== chat) return;
   if (flood(chat)) return tg(env, "answerCallbackQuery", { callback_query_id: cb.id, text: "Слишком часто, подождите минуту" });
+  if (/^f[rd](:|$)/.test(cb.data)) return freeCallback(env, cb, chat);
   if (cb.data?.startsWith("s:")) {
     const feed = cb.data.slice(2);
     await tg(env, "answerCallbackQuery", { callback_query_id: cb.id });
@@ -662,6 +825,22 @@ async function tick(env) {
     const text = GREETINGS[Math.floor(Date.parse(today) / 604800000) % GREETINGS.length];
     for (const u of us) { jobs.push({ chat_id: u.chat_id, key: "mon:" + today, text }); budget--; }
   }
+  // 4б) предупреждение «в Moodle чужое расписание» — днём, один раз на группу и неделю
+  if (budget > 0 && m >= 9 * 60 && m < 21 * 60) {
+    const wr = await wrongGroups(env);
+    const codes = Object.keys(wr).slice(0, 40);
+    if (codes.length) {
+      const { results: us } = await env.DB.prepare(
+        `SELECT u.chat_id, u.group_code FROM users u WHERE u.notify=1 AND u.group_code IN (${codes.map((_, i) => "?" + (i + 2)).join(",")})
+           AND NOT EXISTS (SELECT 1 FROM sent s WHERE s.chat_id=u.chat_id
+             AND s.k = 'wr:' || u.group_code || ':' || json_extract(?1, '$."' || u.group_code || '".week')) LIMIT ${Math.min(budget, 20)}`)
+        .bind(JSON.stringify(wr), ...codes).all();
+      for (const u of us) {
+        jobs.push({ chat_id: u.chat_id, key: `wr:${u.group_code}:${wr[u.group_code].week}`, text: wrongText(u.group_code), extra: { reply_markup: supportKb } });
+        budget--;
+      }
+    }
+  }
   // 5) разовая рассылка (ниже по приоритету, чем всё остальное)
   if (budget > 0 && BROADCAST) {   // ночью (22:00–08:00) уходит без звука
     const { results: us } = await env.DB.prepare(
@@ -709,7 +888,7 @@ async function tick(env) {
   }
   // ночная очистка (раньше стояла после отправок и срабатывала, только если в 04:00 что-то отправлялось)
   if (m === 4 * 60) {
-    await env.DB.prepare("DELETE FROM sent WHERE k NOT LIKE 'n:%' AND k NOT LIKE 'bc:%' AND k <> 'jq' AND k NOT LIKE '%'||?1||'%'").bind(today).run();
+    await env.DB.prepare("DELETE FROM sent WHERE k NOT LIKE 'n:%' AND k NOT LIKE 'bc:%' AND k NOT LIKE 'wr:%' AND k <> 'jq' AND k NOT LIKE '%'||?1||'%'").bind(today).run();
     await env.DB.prepare("DELETE FROM sent WHERE k LIKE 'n:%' AND CAST(substr(k,3) AS INTEGER) IN (SELECT id FROM news WHERE seen < ?1)").bind(nowSec(env) - 7 * 86400).run();
   }
   if (!jobs.length) return;
@@ -752,7 +931,7 @@ export default {
         { command: "today", description: "Расписание на сегодня" }, { command: "tomorrow", description: "На завтра" },
         { command: "week", description: "На неделю" }, { command: "nextweek", description: "Следующая неделя" },
         { command: "next", description: "Ближайшая пара" }, { command: "group", description: "Сменить группу" },
-        { command: "news", description: "Подписка на новости и объявления" }, { command: "notify", description: "Настройки уведомлений" }, { command: "room", description: "Карта кабинета: /room 507" }, { command: "joke", description: "Анекдот дня" }, { command: "info", description: "Что умеет бот" }, { command: "support", description: "Написать в поддержку" }] });
+        { command: "news", description: "Подписка на новости и объявления" }, { command: "notify", description: "Настройки уведомлений" }, { command: "room", description: "Карта кабинета: /room 507" }, { command: "freerooms", description: "Свободные кабинеты" }, { command: "joke", description: "Анекдот дня" }, { command: "info", description: "Что умеет бот" }, { command: "support", description: "Написать в поддержку" }] });
       return Response.json({ setWebhook: a, setMyCommands: b });
     }
     if (req.method === "POST" && url.pathname === "/webhook") {
