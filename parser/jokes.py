@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """anekdotov.net: «лучшие анекдоты дня» -> out/jokes.sql (запас для бота, если Cloudflare не пускают на сайт).
 
-Строки кладутся в таблицу jokes с day = 'p:<хэш>'. Бот берёт оттуда анекдот, только если прямой запрос не удался.
+Строки кладутся в таблицу jokes с day = 'p:<дата>:<номер>' (первый на странице — с большим номером). Бот берёт оттуда анекдот, только если прямой запрос не удался.
 """
 from __future__ import annotations
 
-import hashlib
+import datetime as dt
 import html as htmllib
 import re
 import sys
@@ -16,7 +16,8 @@ import httpx
 URL = "https://anekdotov.net/anekdot/day/"
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
       "Accept-Language": "ru-RU,ru;q=0.9"}
-# тот же фильтр, что в worker/src/index.js (JOKE_BAD)BAD = re.compile(r"х[уy][йеёяию]|пизд|бляд|бля[тд]ь|пидор|пидр|залуп|гандон|[её]б(?:ать|ан[аоуыи]?|ал[аио]?|аш|ну[лт]|ун)|трахат|трахн|секс|путин|путл", re.I)
+# тот же фильтр, что в worker/src/index.js (JOKE_BAD)
+BAD = re.compile(r"х[уy][йеёяию]|пизд|бляд|бля[тд]ь|пидор|пидр|мудак|залуп|гандон|[её]б(?:ать|ан[аоуыи]?|ал[аио]?|аш|ну[лт]|ун)|проститутк|шлюх|сиськ|трахат|трахн|секс|путин|путл", re.I)
 ITEM = re.compile(r"""<div[^>]*class\s*=\s*["']?anekdot(?=["'\s>])[^>]*>([\s\S]*?)</div>""", re.I)
 
 
@@ -57,7 +58,13 @@ def main() -> int:
         for k in j[:2]:
             print("фрагмент:", page[max(0, k - 40):k + 300].replace("\n", " "))
     Path("out").mkdir(exist_ok=True)
-    sql = "".join(f"INSERT OR IGNORE INTO jokes (day, text) VALUES ({q('p:' + hashlib.md5(t.encode()).hexdigest()[:12])}, {q(t)});\n" for t in items)
+    # ключ p:<дата>:<номер> — бот берёт сначала самые свежие; запас старше 14 дней удаляем
+    today = dt.datetime.now(dt.timezone(dt.timedelta(hours=5))).date()
+    old = (today - dt.timedelta(days=14)).isoformat()
+    sql = "".join(f"INSERT OR IGNORE INTO jokes (day, text) SELECT {q(f'p:{today.isoformat()}:{99 - i:02d}')}, {q(t)} "
+                  f"WHERE NOT EXISTS (SELECT 1 FROM jokes WHERE text = {q(t)});\n" for i, t in enumerate(items[:99]))
+    sql += f"DELETE FROM jokes WHERE day LIKE 'p:%' AND day < {q('p:' + old)};\n"
+    sql += "DELETE FROM jokes WHERE day LIKE 'p:%' AND day NOT GLOB 'p:[0-9][0-9][0-9][0-9]-*';\n"   # запас старого формата (p:<хэш>)
     Path("out/jokes.sql").write_text(sql, encoding="utf-8")
     return 0 if items else 1
 
